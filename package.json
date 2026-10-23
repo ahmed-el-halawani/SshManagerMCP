@@ -1,0 +1,48 @@
+{
+  "name": "ssh-resource-manager",
+  "productName": "SSH Resource Manager",
+  "version": "1.0.0",
+  "description": "Local registry of SSH hosts and project locations, with GUI and MCP stdio server",
+  "author": "Ahmed Elhalawany",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "main": "dist/desktop/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.renderer.json",
+    "test": "node --test --test-concurrency=1 --test-timeout=90000 \"tests/*.test.ts\" && node tests/electron-mcp.smoke.mjs",
+    "start": "npm run build && electron .",
+    "mcp": "node dist/mcp/server.js",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "4.6.7"
+  },
+  "allowScripts": {
+    "electron@44.3.0": true,
+    "electron-winstaller@5.4.0": true
+  },
+  "build": {
+    "appId": "dev.local.ssh-resource-manager",
+    "asar": false,
+    "directories": { "output": "dist-installer" },
+    "files": ["dist/**", "docs/**", "package.json"],
+    "extraResources": [{ "from": "docs", "to": "docs" }],
+    "win": { "target": "nsis" },
+    "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "deleteAppDataOnUninstall": false }
+  }
+}
