@@ -1,4 +1,4 @@
-# SSH Resource Manager
+# SSH Resource Manager MCP
 
 A Windows desktop app plus a local MCP (stdio) server that keeps one registry of your SSH machines and of where each project lives on them. Your AI agent finds hosts, checks them, and verifies project state through MCP, then runs normal OpenSSH from its own terminal. The app never runs a model, needs no API key, and is not a command executor.
 
