@@ -326,7 +326,8 @@ test('recovery: interrupted transfer is partial, retry verifies; destination edi
   const dst = cloneTo(src);
   for (const f of ['a.txt', 'b.txt', 'c.txt']) writeFileSync(join(src, f), `${f} v2\n`);
   const { core, pre, project, loc } = setup(src, dst);
-  core.acquireLease({ location_id: loc.id, operation_id: 'op1', owner: 'agent-a', ttl_seconds: 10 });
+  // long TTL: the test itself can take >10 s on a slow CI runner; expiry is simulated explicitly below
+  core.acquireLease({ location_id: loc.id, operation_id: 'op1', owner: 'agent-a', ttl_seconds: 600 });
   assert.ok((await pre()).facts.some((f) => f.kind === 'lease_held'));
 
   const cut = await syncOnce(core, project, loc, src, dst, pre, 1); // connection dropped after one file

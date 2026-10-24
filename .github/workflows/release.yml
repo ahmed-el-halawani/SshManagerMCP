@@ -16,6 +16,11 @@ concurrency:
 
 env:
   CSC_IDENTITY_AUTO_DISCOVERY: 'false' # no code-signing certificate in CI
+  # Electron / electron-builder downloads (Electron zip, NSIS, icon tools). Their default folders, outside the repo
+  # on purpose: inside it, the extracted helper scripts inherit this package's "type": "module" and crash.
+  ELECTRON_CACHE_PATHS: |
+    ~\AppData\Local\electron\Cache
+    ~\AppData\Local\electron-builder\Cache
 
 jobs:
   release:
@@ -24,36 +29,40 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm # ~/.npm, keyed on package-lock.json
 
-      # node_modules (including the Electron binary its postinstall puts there): a hit skips `npm ci` entirely.
-      - name: Cache node_modules
+      # Restore and save are separate steps so a cache is kept even when a later step (tests) fails.
+      # node_modules includes the Electron binary its postinstall downloads: a hit skips `npm ci` entirely.
+      - name: Restore node_modules
         id: modules
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v6
         with:
           path: node_modules
           key: modules-${{ runner.os }}-node24-${{ hashFiles('package-lock.json') }}
 
-      # Electron / electron-builder downloads (Electron zip, NSIS, icon tools): same versions = no re-download.
-      # Their default folders, outside the repo on purpose: inside it, the extracted helper scripts would
-      # inherit this package's "type": "module" and crash (seen in a local dry run).
-      - name: Cache Electron downloads
-        uses: actions/cache@v4
+      - name: Restore Electron downloads
+        id: electron
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            ~\AppData\Local\electron\Cache
-            ~\AppData\Local\electron-builder\Cache
+          path: ${{ env.ELECTRON_CACHE_PATHS }}
           key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: electron-${{ runner.os }}-
 
       - name: Install dependencies
         if: steps.modules.outputs.cache-hit != 'true'
         run: npm ci
+
+      - name: Save node_modules
+        if: steps.modules.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: node_modules
+          key: ${{ steps.modules.outputs.cache-primary-key }}
 
       - name: Set version
         id: version
@@ -67,24 +76,34 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Before the tests: they check that the built runner (dist/cli/run.js) exists.
+      - name: Build
+        run: npm run build
+
       - name: Test
         run: npm test
 
       - name: Build installer
         run: |
-          npm run build
           npx electron-builder --win --publish never
           Get-ChildItem dist-installer -Filter *.exe | ForEach-Object { "$($_.Name)  $([math]::Round($_.Length / 1MB, 1)) MB" }
 
+      - name: Save Electron downloads
+        if: always() && steps.electron.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.ELECTRON_CACHE_PATHS }}
+          key: ${{ steps.electron.outputs.cache-primary-key }}
+
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SSH-Resource-Manager-${{ steps.version.outputs.version }}
           path: dist-installer/*Setup*.exe
           if-no-files-found: error
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: SSH Resource Manager ${{ steps.version.outputs.version }}
