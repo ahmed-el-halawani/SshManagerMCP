@@ -10,6 +10,7 @@ export type HostRow = {
   declared_os: string; observed_os: string | null; observed_os_detail: string | null;
   description: string; instructions: string; tags_json: string; default_remote_directory: string | null;
   created_at: string; updated_at: string; revision: number; last_check_id: string | null; identity_generation: number;
+  signing_mode: 'off' | 'login_keychain' | 'build_keychain'; signing_state_json: string | null;
 };
 
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -110,7 +111,9 @@ export function getHost(db: DB, hostId: string) {
     ...hostSummary(db, row), profile: profileOf(row), description: row.description, instructions: row.instructions,
     observed_os_detail: row.observed_os_detail, default_remote_directory: row.default_remote_directory,
     identity_generation: row.identity_generation, created_at: row.created_at, updated_at: row.updated_at,
-    auth: profileOf(row).auth ?? 'key', password_stored: !!db.prepare('SELECT 1 FROM host_secrets WHERE host_id=?').get(hostId),
+    auth: profileOf(row).auth ?? 'key', password_stored: !!db.prepare("SELECT 1 FROM host_secrets WHERE host_id=? AND kind='password'").get(hostId),
+    signing: { mode: row.signing_mode, build_keychain: row.signing_state_json ? JSON.parse(row.signing_state_json) : null,
+      build_keychain_secret_stored: !!db.prepare("SELECT 1 FROM host_secrets WHERE host_id=? AND kind='build_keychain'").get(hostId) },
     capabilities: capabilities(db, hostId), resources, trust,
   };
 }
@@ -191,6 +194,7 @@ function applyPatch(db: DB, row: HostRow, patch: z.infer<typeof HostPatch>, sour
       observedOs = null;
       // Never send the old endpoint's password to a new endpoint/account.
       db.prepare('DELETE FROM host_secrets WHERE host_id=?').run(row.id);
+      db.prepare('UPDATE hosts SET signing_state_json=NULL WHERE id=?').run(row.id); // a build keychain belongs to the old machine
       // Host identity change invalidates every project location bound to it.
       db.prepare('UPDATE project_locations SET location_generation=location_generation+1, identity_state=?, updated_at=? WHERE host_id=?')
         .run('unverified', now(), row.id);

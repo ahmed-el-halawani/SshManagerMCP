@@ -2,6 +2,9 @@
 console.log = console.error;
 console.info = console.error;
 
+import { spawn } from 'node:child_process';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -10,6 +13,22 @@ import { ConsistencyPolicy, HostPatch, IdemKey, LocationSpec, Metadata, Profile,
 
 const core = createCore({ source: 'mcp' });
 const log = createLogger(core.dataDir, 'mcp');
+
+/**
+ * An agent connecting means the user is working: start the app in the tray if it isn't running.
+ * The single-instance lock makes this a no-op when it is. This server never depends on the app;
+ * a later Quit from the tray is respected until the next agent connects.
+ */
+function ensureApp() {
+  if (!process.versions.electron || process.env.SSHRM_NO_GUI) return; // plain node (tests, dev scripts)
+  const dev = basename(process.execPath).toLowerCase().startsWith('electron');
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  try {
+    spawn(process.execPath, [...(dev ? [join(dirname(fileURLToPath(import.meta.url)), '..', '..')] : []), '--background'], { detached: true, stdio: 'ignore', env, windowsHide: true }).unref();
+  } catch (e) { log('warn', 'could not start the app', { error: String(e) }); }
+}
+ensureApp();
 const server = new McpServer({ name: 'ssh-resource-manager', version: '1.0.0' }, {
   instructions: 'Registry of SSH hosts and project locations on this PC. It does NOT execute arbitrary commands: get a recipe with ssh_hosts_get_connection_recipe and run OpenSSH from your own terminal. Before build/run/test on a remote location, call ssh_projects_preflight; after transferring files call ssh_projects_verify_sync. Never send passwords or private keys.',
 });
@@ -63,7 +82,8 @@ tool('ssh_hosts_check', 'Run a bounded, read-only SSH connectivity + OS check (B
 tool('ssh_hosts_probe_capabilities', 'Run built-in read-only probes: "macos.xcode" or "binary:<name>" (e.g. binary:git). Declared capability is not proof; this is.',
   z.object({ host_id: uuid, probe_ids: z.array(z.string()).min(1).max(10) }), RO_NET, (i) => core.probeCapabilities(i));
 
-tool('ssh_hosts_get_connection_recipe', 'Get the exact OpenSSH argv for YOUR terminal (shell or file_transfer). caller_environment must match where you run commands (windows-native = PowerShell/cmd on Windows). Nothing is executed.',
+tool('ssh_hosts_get_connection_recipe', 'Get the exact OpenSSH argv for YOUR terminal (shell or file_transfer). caller_environment must match where you run commands (windows-native = PowerShell/cmd on Windows). Nothing is executed. ' +
+  'For macOS hosts the shell recipe has a "signing" block: when its mode is not off, run anything that code-signs (iOS device/release builds) through signing.argv so the keychain is unlocked in that SSH session; plain ssh fails with errSecInternalComponent.',
   z.object({ host_id: uuid, caller_environment: z.enum(['windows-native', 'posix-native', 'wsl']), purpose: z.enum(['shell', 'file_transfer']).optional() }), RO, (i) => core.connectionRecipe(i));
 
 tool('ssh_hosts_list_directory', 'Read-only: list sub-folders of a path on a POSIX host (marks git repos and folders with pubspec.yaml/package.json). Use it to find an existing checkout before binding a project location instead of guessing or cloning.',
@@ -71,6 +91,10 @@ tool('ssh_hosts_list_directory', 'Read-only: list sub-folders of a path on a POS
 
 tool('ssh_hosts_approve_host_key', 'Trust a host key. ONLY call after the USER explicitly confirmed this fingerprint matches one read from the machine itself. A LAN keyscan is not proof.',
   z.object({ host_id: uuid, fingerprint: z.string(), algorithm: z.string(), expected_identity_generation: z.number().int() }), { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.approveHostKey(i));
+
+tool('ssh_hosts_setup_build_keychain', 'macOS hosts whose user chose the "build keychain" signing mode: (re)create the separate signing keychain automatically (copies code-signing identities from the login keychain using the stored password; no user interaction). ' +
+  'Normally not needed: the signing runner does it on first use. Call it after the user renewed their certificate or when the runner reports the build keychain is broken. You cannot change the signing mode; only the user can, in the GUI.',
+  z.object({ host_id: uuid }), { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.setupBuildKeychain(i));
 
 tool('ssh_hosts_remove', 'Remove the local registry record only. Does not touch the remote machine, keys or ssh config.',
   z.object({ host_id: uuid, expected_revision: z.number().int() }), { readOnlyHint: false, destructiveHint: true, openWorldHint: false }, (i) => core.removeHost(i));

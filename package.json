@@ -40,9 +40,9 @@
     "appId": "dev.local.ssh-resource-manager",
     "asar": false,
     "directories": { "output": "dist-installer" },
-    "files": ["dist/**", "docs/**", "package.json"],
+    "files": ["dist/**", "docs/**", "assets/icon.png", "package.json"],
     "extraResources": [{ "from": "docs", "to": "docs" }],
-    "win": { "target": "nsis" },
+    "win": { "target": "nsis", "icon": "assets/icon.png" },
     "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "deleteAppDataOnUninstall": false }
   }
 }

@@ -62,13 +62,27 @@ Error codes: `VALIDATION_ERROR NOT_FOUND REVISION_CONFLICT IDEMPOTENCY_CONFLICT 
 | GUI auto-check | off (opt-in: every 60 s, at most 2 at a time, with jitter) |
 | Log rotation | at 5 MiB, one rotated file |
 
-## Password authentication (migration 3)
+## Password authentication (migrations 3, 6)
 - **Profile:** `auth: "key" | "password"` (default `key`).
 - **Storage:** the password is set only through the GUI (`setHostPassword`; no MCP tool exists) and stored as a DPAPI (CurrentUser) blob in `host_secrets`.
 - **ssh options for password hosts:** `BatchMode=no`, `PreferredAuthentications=password,keyboard-interactive`, `PubkeyAuthentication=no`, `NumberOfPasswordPrompts=1`, `StrictHostKeyChecking=yes`. The env sets `SSH_ASKPASS=<data-dir>\askpass.cmd`, `SSH_ASKPASS_REQUIRE=force` and `SSHRM_HOST_ID`. No TTY is involved, so nothing can hang on a prompt.
 - **Recipes:** return the same `env` and never the password.
 - **Lifecycle:** changing a profile identity field deletes the secret.
 - **Host-key candidates:** captured with `ssh` itself into a throwaway known_hosts file with all auth disabled, not with `ssh-keyscan`. Windows' keyscan 9.5 cannot negotiate key exchange with OpenSSH 10 servers. This also works through ProxyJump.
+
+## Code signing over SSH (migration 6)
+- **Schema:** `host_secrets` is keyed `(host_id, kind)`, where kind is `password` or `build_keychain`. `hosts.signing_mode` is `off` (the default), `login_keychain` or `build_keychain`. `hosts.signing_state_json` holds the setup result or the last error.
+- **Who decides:** only the user sets the mode, through the GUI (`setSigningMode`; there is no MCP tool). Turning a mode off, or switching away from the build keychain, deletes the build keychain secret.
+- **Runner:** `<exe> dist/cli/run.js --data-dir=… --host=… -- "<cmd>"`, returned as `signing.argv` in the macOS shell recipe.
+  - The remote side runs `/bin/sh -c <wrapper> sshrm <cmd>`. The wrapper reads the secret as the first stdin line and passes it to `security unlock-keychain` through the `printf` builtin, so it is never in argv, env or logs.
+  - It then runs `exec "${SHELL:-/bin/sh}" -lc "$1"`.
+  - Exit codes: 96 = build keychain missing (the runner sets it up again once and retries), 97 = no secret on stdin, 98 = unlock failed, 3 = manager error.
+- **`login_keychain`:** unlocks `~/Library/Keychains/login.keychain-db` with the stored host password.
+- **`build_keychain`:** `~/Library/Keychains/sshrm-signing.keychain-db`, with a random password stored with DPAPI.
+  - It has no auto-lock, holds only code-signing identities, comes first in the user search list, and its partition list allows `apple-tool:`, `apple:` and `codesign:`.
+  - Setup (`ssh_hosts_setup_build_keychain`, or automatically on first run) exports identities from the login keychain using the stored password. macOS refuses that for keys whose access control needs a click (`needs_p12`). The user then imports a `.p12` once in the GUI; the file is read in the main process and sent over SSH stdin.
+  - The `.p12` password is passed as an argument to `security import` for a moment, inside a temp directory with mode 700.
+- **Identity change:** changing the host's identity deletes all its secrets and the signing state.
 
 ## Known limits (v1)
 - Password auth needs Windows (DPAPI via Windows PowerShell 5.1, about 300 ms per decrypt).

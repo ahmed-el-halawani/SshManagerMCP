@@ -12,5 +12,5 @@
     "rootDir": "src",
     "types": ["node"]
   },
-  "include": ["src/core", "src/mcp", "src/desktop/main.ts", "src/desktop/preload.cts"]
+  "include": ["src/core", "src/mcp", "src/cli", "src/desktop/main.ts", "src/desktop/preload.cts"]
 }

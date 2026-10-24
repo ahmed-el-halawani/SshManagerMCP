@@ -37,6 +37,8 @@ pre { background: color-mix(in srgb, var(--fg) 5%, transparent); padding: 8px; b
 .id-content_verified { color: var(--ok); border-color: currentColor; }
 .warnbox { color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); padding: 8px 10px; border-radius: 6px; margin: 8px 0; }
 .warnbox .small { color: var(--fg); opacity: .85; margin-top: 2px; }
+.signing-mode { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; cursor: pointer; }
+.signing-mode input { margin-top: 3px; }
 .row.nowrap { flex-wrap: nowrap; margin: 0; }
 button.link { border: none; background: none; color: var(--accent); padding: 0 4px; font-size: 12px; }
 .host-projects { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 8px; }

@@ -49,6 +49,18 @@ The MCP server gives you a **registry and verification tools only**. It does not
    - `partial` means some files arrived, for example after a dropped connection. Retry the copy and verify again.
    - Build only after `verified`/`ready`, and re-run preflight before the next build (readiness expires after ~60 s).
 
+## Code signing on macOS hosts (iPhone / release builds)
+- Over plain SSH, `codesign` fails with `errSecInternalComponent`. macOS unlocks a keychain only for the session that unlocked it, and every SSH connection is a new session.
+- Look at the `signing` block of `ssh_hosts_get_connection_recipe`. When `signing.mode` is not `off`, run every command that code-signs this way:
+  - Use `signing.argv` with `signing.env`, then add the remote command as ONE final argument. Examples: `flutter build ios --release`, `flutter run --release -d <udid>`, `xcodebuild` for a device.
+  - The runner opens its own SSH session, unlocks the keychain inside it, and runs your command in a login shell. Output and exit code pass through.
+  - The secret never reaches you. Never ask the user for a keychain password, and never type one.
+- Runner exit codes: 96, 97 or 98 mean the unlock itself failed and your command did not run. 3 is a manager error, printed as JSON on stderr.
+  - **Build keychain mode:** a missing keychain is set up again automatically.
+  - **If the error says a `.p12` is needed:** macOS refused to copy the key without a click. Tell the user to export the certificate once and import it on the host page. Do not try to work around it.
+- `signing.mode` = `off`: tell the user that device builds need a signing mode, which they turn on in the GUI host page. You cannot change it.
+- Keep plain `ssh` for everything that does not sign. The runner does not forward stdin.
+
 ## Other rules
 - A dropped SSH connection does not cancel a remote process. Check before you re-run a mutating command.
 - Do not claim to have seen a screenshot until you have downloaded it and opened it with a vision tool.

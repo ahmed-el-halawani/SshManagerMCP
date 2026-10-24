@@ -26,24 +26,38 @@ function dpapi(script: string, input: string): string {
 export const protect = (plain: string) => dpapi(PROTECT, plain);
 export const unprotect = (blob: string) => dpapi(UNPROTECT, blob);
 
-export function setHostPassword(db: DB, hostId: string, password: string) {
-  if (!password || password.length > 1024 || /[\r\n\0]/.test(password)) throw new AppError('VALIDATION_ERROR', 'password must be 1-1024 characters without newlines');
-  const blob = protect(password);
+/** password = the host account password (SSH login; on macOS also the login keychain). build_keychain = a random password the manager generated. */
+export type SecretKind = 'password' | 'build_keychain';
+
+export function putSecret(db: DB, hostId: string, kind: SecretKind, plain: string) {
+  const blob = protect(plain);
   tx(db, () => {
     if (!db.prepare('SELECT 1 FROM hosts WHERE id=?').get(hostId)) throw new AppError('NOT_FOUND', `host ${hostId} not found`);
-    db.prepare(`INSERT INTO host_secrets(host_id, kind, secret_blob, updated_at) VALUES(?, 'password', ?, ?)
-      ON CONFLICT(host_id) DO UPDATE SET secret_blob=excluded.secret_blob, updated_at=excluded.updated_at`).run(hostId, blob, now());
-    db.prepare("INSERT INTO audit_events(timestamp, source, action, host_id, details_json) VALUES(?, 'gui', 'set_password', ?, '{}')").run(now(), hostId);
+    db.prepare(`INSERT INTO host_secrets(host_id, kind, secret_blob, updated_at) VALUES(?, ?, ?, ?)
+      ON CONFLICT(host_id, kind) DO UPDATE SET secret_blob=excluded.secret_blob, updated_at=excluded.updated_at`).run(hostId, kind, blob, now());
+    db.prepare("INSERT INTO audit_events(timestamp, source, action, host_id, details_json) VALUES(?, 'gui', ?, ?, '{}')").run(now(), `set_secret:${kind}`, hostId);
   });
+}
+
+/** Decrypts in-process. Callers must hand the result only to a child process's stdin, never to logs, argv, env or API output. */
+export function getSecret(db: DB, hostId: string, kind: SecretKind): string | null {
+  const r = db.prepare('SELECT secret_blob FROM host_secrets WHERE host_id=? AND kind=?').get(hostId, kind) as { secret_blob: string } | undefined;
+  return r ? unprotect(r.secret_blob) : null;
+}
+
+export function setHostPassword(db: DB, hostId: string, password: string) {
+  if (!password || password.length > 1024 || /[\r\n\0]/.test(password)) throw new AppError('VALIDATION_ERROR', 'password must be 1-1024 characters without newlines');
+  putSecret(db, hostId, 'password', password);
   return { host_id: hostId, password_stored: true };
 }
 
 export function clearHostPassword(db: DB, hostId: string) {
-  db.prepare('DELETE FROM host_secrets WHERE host_id=?').run(hostId);
+  db.prepare("DELETE FROM host_secrets WHERE host_id=? AND kind='password'").run(hostId);
   return { host_id: hostId, password_stored: false };
 }
 
-export const hasPassword = (db: DB, hostId: string) => !!db.prepare('SELECT 1 FROM host_secrets WHERE host_id=?').get(hostId);
+export const hasSecret = (db: DB, hostId: string, kind: SecretKind) => !!db.prepare('SELECT 1 FROM host_secrets WHERE host_id=? AND kind=?').get(hostId, kind);
+export const hasPassword = (db: DB, hostId: string) => hasSecret(db, hostId, 'password');
 
 /**
  * SSH_ASKPASS must be a single executable path, so a .cmd shim re-enters the current runtime
@@ -63,7 +77,7 @@ if (!/password|passcode/i.test(prompt) || /passphrase/i.test(prompt)) process.ex
 const id = process.env.SSHRM_HOST_ID;
 if (!id) process.exit(1);
 const db = new DatabaseSync(join(${JSON.stringify(dataDir)}, 'registry.db'), { readOnly: true });
-const row = db.prepare('SELECT secret_blob FROM host_secrets WHERE host_id=?').get(id);
+const row = db.prepare("SELECT secret_blob FROM host_secrets WHERE host_id=? AND kind='password'").get(id);
 db.close();
 if (!row) process.exit(1);
 const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ${JSON.stringify(UNPROTECT)}], { input: row.secret_blob, encoding: 'utf8', windowsHide: true });

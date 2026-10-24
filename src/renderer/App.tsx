@@ -255,6 +255,50 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
 }
 const L = ({ t, children }: { t: string; children: ReactNode }) => <label className="field"><span>{t}</span>{children}</label>;
 
+const SIGNING_MODES = [
+  { mode: 'off', title: 'Off', text: 'Agents cannot sign over SSH. iPhone/release builds fail with errSecInternalComponent.' },
+  { mode: 'login_keychain', title: 'Unlock the login keychain with the stored password',
+    text: 'Simplest. Each signing build unlocks your login keychain in its own SSH session using the host password. That password also opens everything else in the login keychain.' },
+  { mode: 'build_keychain', title: 'Separate build keychain (recommended)',
+    text: 'Set up automatically once: your code-signing identity is copied into its own keychain with a random password. Builds unlock only that keychain; your login password is not used again.' },
+];
+
+function SigningSettings({ h, act, busy }: { h: any; act: (fn: () => Promise<unknown>) => Promise<void>; busy: boolean }) {
+  const s = h.signing;
+  const [p12pw, setP12pw] = useState('');
+  const choose = (mode: string) => act(async () => {
+    if (mode !== 'off' && !confirm(`${SIGNING_MODES.find((m) => m.mode === mode)!.title}?\n\nAI agents using this manager will then be able to code-sign on ${h.name} without asking you.`)) return;
+    const r = await call('setSigningMode', { host_id: h.id, mode });
+    if (r.needs_setup) await call('setupBuildKeychain', { host_id: h.id });
+  });
+  return (
+    <>
+      <h3>Code signing over SSH</h3>
+      <p className="muted small">macOS unlocks a keychain only for the SSH session that unlocked it. Agents run signing builds through the manager's runner, which unlocks it inside that same session. The secret never reaches the agent.</p>
+      {SIGNING_MODES.map((m) => (
+        <label key={m.mode} className="signing-mode">
+          <input type="radio" name={`sign-${h.id}`} disabled={busy || (m.mode !== 'off' && !h.password_stored)} checked={s.mode === m.mode} onChange={() => choose(m.mode)} />
+          <span><b>{m.title}</b><div className="muted small">{m.text}</div></span>
+        </label>
+      ))}
+      {!h.password_stored && <div className="warn small">Store the host password first (Edit): both modes use it, the build keychain only once during setup.</div>}
+      {s.mode === 'build_keychain' && (
+        <div className="small">
+          {s.build_keychain_secret_stored && s.build_keychain?.identities
+            ? <>Build keychain ready ({age(s.build_keychain.set_up_at)}): {s.build_keychain.identities.map((i: any) => i.name).join(', ')}</>
+            : <span className="warn">Build keychain not set up yet.{s.build_keychain?.last_error ? ` Last attempt: ${s.build_keychain.last_error}` : ''}</span>}
+          {' '}<button disabled={busy} onClick={() => act(() => call('setupBuildKeychain', { host_id: h.id }))}>{s.build_keychain_secret_stored ? 'Set up again (after a certificate renewal)' : 'Set up now'}</button>
+          {s.build_keychain?.needs_p12 && <div className="warnbox">macOS won't let the manager copy your signing key without a click on the Mac. Do this once: on the Mac open Keychain Access → login → My Certificates, right-click “Apple Development: …” → Export… as .p12 with a password, copy the file to this PC, then import it here.</div>}
+          <div className="row">
+            <input type="password" placeholder=".p12 password" value={p12pw} onChange={(e) => setP12pw(e.target.value)} />
+            <button disabled={busy} onClick={() => act(async () => { const r = await window.api.importP12(h.id, p12pw); if (r && !r.ok) throw r.error; setP12pw(''); })}>Import .p12…</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; onEdit: () => void }) {
   const { data: h, error, reload } = usePoll(() => call('getHost', { host_id: id }), [id]);
   const hist = usePoll(() => call('hostHistory', { host_id: id, limit: 15 }), [id], 5000);
@@ -317,6 +361,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
           <h3>Description</h3><p className="pre">{h.description || <span className="muted">—</span>}</p>
           <h3>Instructions</h3><p className="pre">{h.instructions || <span className="muted">—</span>}</p>
           {h.default_remote_directory && <p>Default remote directory: <span className="mono">{h.default_remote_directory}</span></p>}
+          {(h.observed_os ?? h.declared_os) === 'macos' && <SigningSettings h={h} act={act} busy={busy} />}
         </div>
         <div>
           <h3>Capabilities</h3>
@@ -575,6 +620,18 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
 
 // ---------------- setup ----------------
 
+function StartupSettings() {
+  const [li, setLi] = useState<{ supported: boolean; enabled: boolean } | null>(null);
+  useEffect(() => { window.api.loginItem().then(setLi); }, []);
+  return (
+    <fieldset><legend>Startup and tray</legend>
+      <p className="muted small">Closing the window keeps the app in the tray. AI agents also start it in the tray when they connect. To exit completely, right-click the tray icon → Quit.</p>
+      <label><input type="checkbox" disabled={!li?.supported} checked={!!li?.enabled} onChange={async (e) => setLi(await window.api.setLoginItem(e.target.checked))} /> Start with Windows (in the tray, no window)</label>
+      {li && !li.supported && <div className="muted small">Available in the installed app only.</div>}
+    </fieldset>
+  );
+}
+
 function Setup() {
   const [s, setS] = useState<any>(null);
   const [env, setEnv] = useState<any>(null);
@@ -613,6 +670,7 @@ function Setup() {
         <button onClick={() => copy(cfg)}>Copy</button>
         <p className="muted">Test: ask your agent to call <span className="mono">ssh_manager_environment</span>, then <span className="mono">ssh_hosts_list</span>. MCP gives the agent registry tools only; it still needs its own terminal to run ssh. See docs/AGENT_INSTRUCTIONS.md.</p>
       </fieldset>
+      <StartupSettings />
       <fieldset><legend>Export / import / backup</legend>
         <div className="row">
           <button onClick={async () => { const p = await window.api.exportData(); if (p) setMsg(`Exported to ${p} (no keys, trust approvals or diagnostics)`); }}>Export metadata…</button>

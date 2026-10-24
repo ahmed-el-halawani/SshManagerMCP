@@ -11,7 +11,7 @@ const exe = process.argv[2] ?? resolve('node_modules/electron/dist/electron.exe'
 const entry = process.argv[3] ?? resolve('dist/mcp/server.js');
 const dataDir = mkdtempSync(join(tmpdir(), 'sshrm-smoke-'));
 const client = new Client({ name: 'smoke', version: '1' });
-await client.connect(new StdioClientTransport({ command: exe, args: [entry, `--data-dir=${dataDir}`], env: { ELECTRON_RUN_AS_NODE: '1', SystemRoot: process.env.SystemRoot } }));
+await client.connect(new StdioClientTransport({ command: exe, args: [entry, `--data-dir=${dataDir}`], env: { ELECTRON_RUN_AS_NODE: '1', SSHRM_NO_GUI: '1', SystemRoot: process.env.SystemRoot } }));
 const env = await client.callTool({ name: 'ssh_manager_environment', arguments: {} });
 assert.equal(env.structuredContent.data_dir, dataDir);
 const reg = await client.callTool({ name: 'ssh_hosts_register', arguments: { profile: { mode: 'ssh_alias', alias: 'smoke' }, metadata: { name: 'smoke' }, idempotency_key: 'smoke-0001' } });

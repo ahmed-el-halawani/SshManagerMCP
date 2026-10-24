@@ -10,6 +10,7 @@ import { executionEnvironment, resolveDataDir } from './paths.ts';
 import * as projects from './projects.ts';
 import { Profile, type Source } from './schemas.ts';
 import { clearHostPassword, setHostPassword, writeAskpass } from './secrets.ts';
+import * as signing from './signing.ts';
 import { getSettings, setSettings, type Settings } from './settings.ts';
 import { knownHostsPath } from './ssh.ts';
 
@@ -54,6 +55,9 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     // GUI-only: the MCP server deliberately exposes no way to send or read a password.
     setHostPassword: (i: { host_id: string; password: string }) => setHostPassword(db, z.uuid().parse(i.host_id), z.string().parse(i.password)),
     clearHostPassword: (i: { host_id: string }) => clearHostPassword(db, z.uuid().parse(i.host_id)),
+    // code signing over SSH: the mode is the user's choice (GUI only); setup may also be triggered by an agent once the mode is set
+    setSigningMode: (i: unknown) => signing.setSigningMode(ctx, i),
+    setupBuildKeychain: (i: unknown) => signing.setupBuildKeychain(ctx, i),
     hostHistory: (i: { host_id: string; limit?: number }) => ({
       checks: (db.prepare('SELECT * FROM checks WHERE host_id=? ORDER BY started_at DESC LIMIT ?').all(z.uuid().parse(i.host_id), Math.min(i.limit ?? 20, 100)) as Record<string, unknown>[])
         .map((c) => ({ ...c, diagnostics: c.diagnostics_json ? JSON.parse(c.diagnostics_json as string) : null, diagnostics_json: undefined })),

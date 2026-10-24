@@ -9,6 +9,7 @@ import { executionEnvironment } from './paths.ts';
 import type { Profile, Source } from './schemas.ts';
 import { getSettings, type Settings } from './settings.ts';
 import { hasPassword } from './secrets.ts';
+import { signingRecipe } from './signing.ts';
 import { cfgPath, classify, diagnostics, knownHostsPath, psQuote, posixQuote, run, sanitize, splitCommand, sshArgs, sshBaseArgs, type RunResult } from './ssh.ts';
 
 export type Ctx = { db: DB; dataDir: string; source: Source };
@@ -339,6 +340,7 @@ export function connectionRecipe(ctx: Ctx, raw: unknown) {
   if (input.purpose === 'shell') {
     const argv = [splitCommand(s.ssh_path).at(-1)!, ...base.args, '--', base.destination];
     return { ...meta, executable: argv[0], argv, shell: env === 'windows-native' ? 'powershell' : 'posix', display: display(argv),
+      ...((row.observed_os ?? row.declared_os) === 'macos' ? { signing: signingRecipe(ctx, row) } : {}),
       notes: ['Append the remote command as the final argument (or omit for an interactive session if your terminal supports it).', authNote] };
   }
   const remoteHost = base.destination.includes(':') ? `[${base.destination}]` : base.destination;

@@ -6,6 +6,9 @@ declare global {
     api: {
       call: (method: string, arg?: unknown) => Promise<Envelope<unknown>>;
       pickFolder: () => Promise<string | null>;
+      loginItem: () => Promise<{ supported: boolean; enabled: boolean }>;
+      setLoginItem: (enabled: boolean) => Promise<{ supported: boolean; enabled: boolean }>;
+      importP12: (hostId: string, password: string) => Promise<Envelope<unknown> | null>;
       mcpConfig: () => Promise<unknown>;
       exportData: () => Promise<string | null>;
       importPreview: () => Promise<Envelope<unknown> | null>;

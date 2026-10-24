@@ -111,6 +111,19 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE project_locations ADD COLUMN source_location_id TEXT REFERENCES project_locations(id);
   `,
+  // 6: macOS code signing over SSH. One secret per (host, kind); a host-level signing mode chosen by the user.
+  `
+  CREATE TABLE host_secrets_v6(
+    host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('password', 'build_keychain')), secret_blob TEXT NOT NULL, updated_at TEXT NOT NULL,
+    PRIMARY KEY(host_id, kind)
+  );
+  INSERT INTO host_secrets_v6 SELECT host_id, kind, secret_blob, updated_at FROM host_secrets;
+  DROP TABLE host_secrets;
+  ALTER TABLE host_secrets_v6 RENAME TO host_secrets;
+  ALTER TABLE hosts ADD COLUMN signing_mode TEXT NOT NULL DEFAULT 'off' CHECK(signing_mode IN ('off', 'login_keychain', 'build_keychain'));
+  ALTER TABLE hosts ADD COLUMN signing_state_json TEXT;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
