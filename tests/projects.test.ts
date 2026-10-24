@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { before, test } from 'node:test';
@@ -163,6 +164,20 @@ test('Git source vs plain-copy destination: tracked build/ files are out of scop
   const r = await setup(src, dst).pre();
   assert.equal(r.verdict, 'ready', JSON.stringify(r.facts));
   assert.ok(r.facts.some((f) => f.kind === 'scope_difference' && !f.blocking && f.paths?.includes('android/build/report.html')));
+});
+
+test('same commit checked out with CRLF (Windows autocrlf) vs LF is ready via Git blob ids', async () => {
+  const src = tempRepo({ 'a.txt': 'line1\nline2\n', 'lib/b.dart': 'void main() {}\n' });
+  const dst = join(mkdtempSync(join(tmpdir(), 'sshrm-crlf-')), 'clone');
+  git(dirname(dst), 'clone', '-q', src, dst); // helper clones with autocrlf=false: LF bytes
+  const crlf = join(mkdtempSync(join(tmpdir(), 'sshrm-crlf-')), 'win');
+  const r = spawnSync('git', ['-c', 'core.autocrlf=true', 'clone', '-q', src, crlf], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  spawnSync('git', ['config', 'core.autocrlf', 'true'], { cwd: crlf });
+  assert.ok(readFileSync(join(crlf, 'a.txt'), 'utf8').includes('\r\n'), 'fixture must have CRLF bytes');
+  const pre = await setup(crlf, dst).pre();
+  assert.equal(pre.verdict, 'ready', JSON.stringify(pre.facts));
+  assert.ok(pre.facts.some((f) => f.kind === 'filter_only_differences' && !f.blocking));
 });
 
 test('find on host: matches by folder and package name, ranks same Git repo first, rejects other repos', async () => {

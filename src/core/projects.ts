@@ -185,7 +185,8 @@ const NON_GIT_EXCLUDES = ['.git', '.git/**', '**/node_modules/**', '**/.dart_too
 const ROOT_ISSUE = 'path is a home or filesystem root, not a project directory; not scanned';
 const PRUNE_NAMES =['.git', 'node_modules', '.dart_tool', 'build', 'Pods', '.gradle', 'DerivedData', '__pycache__', '.venv', 'dist'];
 
-type Entry = { p: string; t: 'f' | 'l'; h: string };
+/** h = sha256 of the bytes; g = Git blob id (after Git's eol/clean filters), present when the side is a Git repo. */
+type Entry = { p: string; t: 'f' | 'l'; h: string; g?: string };
 export type GitFacts = {
   available: boolean; is_repo: boolean; root?: string; subdir?: string; branch?: string | null; detached?: boolean; head?: string | null;
   root_commits?: string[]; remotes?: string[]; git_dir_is_file?: boolean;
@@ -254,7 +255,20 @@ function applyExclusions(files: string[], isRepo: boolean, policy: ConsistencyPo
   return { kept, excluded };
 }
 
-const finishManifest = (entries: Entry[], excluded: number) => {
+/**
+ * Git blob ids via `git hash-object --stdin-paths`, which applies the repo's eol/clean filters.
+ * Windows (autocrlf) and macOS checkouts of the same commit have different bytes but identical blobs.
+ */
+async function addGitBlobIds(entries: Entry[], hash: (input: string) => Promise<{ stdout: string; exit_code: number | null }>) {
+  const files = entries.filter((e) => e.t === 'f' && !e.p.includes('\n'));
+  if (!files.length) return;
+  const r = await hash(files.map((e) => e.p).join('\n') + '\n');
+  const ids = r.stdout.split(/\r?\n/).filter((l) => /^[0-9a-f]{40,64}$/.test(l));
+  if (r.exit_code !== 0 || ids.length !== files.length) return; // fall back to byte comparison only
+  files.forEach((e, i) => { e.g = ids[i]; });
+}
+
+const finishManifest =(entries: Entry[], excluded: number) => {
   entries.sort((a, b) => (a.p < b.p ? -1 : a.p > b.p ? 1 : 0));
   return { count: entries.length, excluded, entries, digest: sha(entries.map((e) => `${e.p}\0${e.t}\0${e.h}`).join('\n')) };
 };
@@ -271,7 +285,7 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
     return { path_state: 'exists', canonical_path: canonical, layout_issues: [ROOT_ISSUE], stable: true };
   }
   const git = splitCommand(s.git_path);
-  const g = (args: string[], max?: number) => run(git, ['-c', 'core.quotepath=off', ...args], { cwd: canonical, timeoutMs: s.inspect_timeout_s * 1000, maxBytes: max });
+  const g = (args: string[], max?: number, input?: string) => run(git, ['-c', 'core.quotepath=off', ...args], { cwd: canonical, timeoutMs: s.inspect_timeout_s * 1000, maxBytes: max, input });
   const probe = await g(['rev-parse', '--is-inside-work-tree']);
   const available = probe.spawn_error !== 'ENOENT';
   const isRepo = available && probe.exit_code === 0 && probe.stdout.trim() === 'true';
@@ -316,6 +330,7 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
       else if (ls.isFile()) entries.push({ p: f, t: 'f', h: sha(readFileSync(abs)) }); // ponytail: whole-file read; stream if multi-GB assets matter
     } catch { /* tracked but deleted in working tree: not part of content */ }
   }
+  if (isRepo) await addGitBlobIds(entries, (input) => g(['hash-object', '--stdin-paths'], 64 << 20, input));
   const stable = !isRepo || (await statusOf()) === statusBefore;
   return {
     path_state: 'exists', canonical_path: canonical, git: facts, stable,
@@ -423,10 +438,13 @@ xargs -0 $H 2>/dev/null; echo "@@DONE"`;
     const name = m[1] ? m[3].replaceAll('\\n', '\n').replaceAll('\\\\', '\\') : m[3];
     entries.push({ p: name.replace(/^\.\//, ''), t: 'f', h: m[2] });
   }
-  for (const l of links.filter((x) => kept.includes(x.p))) entries.push({ p: l.p, t: 'l', h: sha(l.target) });
+  const keptSet = new Set(kept);
+  const scopedLinks = links.filter((x) => keptSet.has(x.p)); // ignored build output (ios/.symlinks, ephemeral/) is out of scope
+  for (const l of scopedLinks) entries.push({ p: l.p, t: 'l', h: sha(l.target) });
+  if (isRepo) await addGitBlobIds(entries, (input) => sshRun(ctx, host, `cd -- ${posixQuote(canonical)} && git hash-object --stdin-paths`, s.inspect_timeout_s, { maxBytes: 64 << 20, input }));
   return {
     path_state: 'exists', canonical_path: canonical, home, git: facts, stable: !isRepo || section(out, 'STATUS2') === status,
-    layout_issues: layoutIssues(kept, links, kept.includes('.gitmodules'), false), manifest: finishManifest(entries, excluded),
+    layout_issues: layoutIssues(kept, scopedLinks, keptSet.has('.gitmodules'), false), manifest: finishManifest(entries, excluded),
   };
 }
 
@@ -614,7 +632,7 @@ const readManifest = (db: DB, inspectionId: string): Entry[] => {
 function compare(db: DB, project: ProjectRow, dest: LocationRow, src: Inspection, dst: Inspection, policy: ConsistencyPolicy) {
   const facts: Fact[] = [];
   const add = (kind: string, detail: string, paths?: string[], blocking = true) => facts.push({ kind, blocking, detail, ...(paths ? { paths: paths.slice(0, 50) } : {}) });
-  const diff = { missing: [] as string[], changed: [] as string[], extra_owned: [] as string[], extra_unknown: [] as string[] };
+  const diff = { missing: [] as string[], changed: [] as string[], extra_owned: [] as string[], extra_unknown: [] as string[], filtered_only: [] as string[] };
   if (dst.path_state === 'unset') { add('path_unset', 'destination path is not set'); return { facts, diff }; }
   if (src.path_state !== 'exists') { add('path_missing', `source path state: ${src.path_state}`); return { facts, diff }; }
   if (dst.error) { add('needs_recheck', `${dst.error.code}: ${dst.error.message}`); return { facts, diff }; }
@@ -631,7 +649,7 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, src: Inspection
     if (dest.identity_state !== 'user_confirmed' && ident.length && dg.root_commits?.length && !dg.root_commits.some((c) => ident.includes(c))) {
       add('wrong_repository', 'destination repository shares no root commit with the project; a similar folder name or URL is not proof of identity');
     }
-    if ((project.repo_subdirectory ?? sg.subdir ?? '') !== (dg.subdir ?? '')) add('unsupported_layout', `subdirectory differs: source '${sg.subdir}' vs destination '${dg.subdir}'`);
+    if ((sg.subdir ?? '') !== (dg.subdir ?? '')) add('unsupported_layout', `subdirectory differs: source '${sg.subdir}' vs destination '${dg.subdir}'`);
     if (sg.conflicts || dg.conflicts) add('conflicts_present', `unmerged entries: source ${sg.conflicts}, destination ${dg.conflicts}`);
     if (sg.branch !== dg.branch) {
       const detached = !dg.branch || !sg.branch;
@@ -660,9 +678,13 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, src: Inspection
   for (const [p, e] of sm) {
     const d = dm.get(p);
     if (!d) diff.missing.push(p);
-    else if (d.h !== e.h || d.t !== e.t) diff.changed.push(p);
+    else if (d.t !== e.t || (e.g && d.g ? d.g !== e.g : d.h !== e.h)) diff.changed.push(p);
+    else if (d.h !== e.h) diff.filtered_only.push(p);
   }
   for (const p of dm.keys()) if (!sm.has(p) && !policy.exclusions.some((g) => matchesGlob(p, g))) (owned.has(p) ? diff.extra_owned : diff.extra_unknown).push(p);
+  if (diff.filtered_only.length) {
+    add('filter_only_differences', `${diff.filtered_only.length} file(s) differ only in bytes Git normalises (line endings / clean filters); compared by Git blob id, same content`, diff.filtered_only, false);
+  }
   const destDirtyAtRisk = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
   if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten', destDirtyAtRisk);
   if (diff.missing.length || diff.changed.length || diff.extra_owned.length || diff.extra_unknown.length) {
