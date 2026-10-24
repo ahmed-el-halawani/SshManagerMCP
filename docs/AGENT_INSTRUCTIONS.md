@@ -19,6 +19,7 @@ The MCP server gives you a **registry and verification tools only**. It does not
 ## Remote environment traps (read the check's `warnings`)
 - `MACOS_PRIVACY_BLOCKED`: SSH cannot read ~/Documents, ~/Desktop or ~/Downloads on that Mac. Don't put projects there. If tools live there, ask the user to enable *Allow full disk access for remote users* (System Settings → General → Sharing → Remote Login (i)). You cannot change this over SSH.
 - `LOGIN_PROFILE_ERROR`: the login profile fails, so PATH additions (flutter, pod, brew, node) are missing. Use the absolute `path` that `binary:<name>` probes report (`found_via` tells you how it was found).
+- iOS device builds over SSH fail with `CodeSign failed` / `errSecInternalComponent` when the login keychain is locked for the SSH session (`security show-keychain-info` says *User interaction is not allowed*). Simulator builds don't sign and are unaffected. Never unlock it with a password yourself. Unlocking only applies to the SSH session it was done in, so ask the user to SSH in, start `screen -S <name>`, run `security unlock-keychain ~/Library/Keychains/login.keychain-db` (and once `security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~/Library/Keychains/login.keychain-db`), then detach with Ctrl-A D. Run the build inside that session with `screen -S <name> -X stuff '<command>\n'` and read its log file.
 - SSH commands run in a non-login shell. Prefer absolute tool paths, or `export PATH=...` at the start of each command.
 - Never guess a remote path, clone, or create a folder to find a project. Use `ssh_projects_find_on_host`, then `ssh_hosts_list_directory` only to look around a specific folder.
 
@@ -30,10 +31,23 @@ The MCP server gives you a **registry and verification tools only**. It does not
    - Only if nothing is found, ask the user where it should go before planning a new folder (`create_if_missing`).
    - If the result lists `blocked_folders`, tell the user that a copy there can't be seen until full disk access for remote users is on.
 2. Decide with the user which location is the source of truth before editing on two machines. The default is this PC.
-3. `ssh_projects_preflight` before any transfer or build. Do not rely on a branch name or on an old sync record.
+   - **Working setups.** A project can have several setups, each with its own source folder on this PC and its own folder on the host (for example the main checkout and a branch experiment). Use the setup the user picked and its paths. If your session runs in a different folder than the registered source, that is not an error: do not edit the registration.
+   - Ask the user which of two things they mean:
+     - A separate setup: `ssh_projects_bind_location` with `source_path` set to the other local copy and a new host folder. The existing source stays as it is.
+     - The same copy moved: `ssh_projects_update_location` on the source.
+   - Two setups may not share or nest a host folder (`PATH_OVERLAP`).
+3. `ssh_projects_preflight` before any transfer or build. Do not rely on a branch name or on an old sync record. One call returns `summary`: the setup, both paths, branch and commit, `readiness`, `files_to_copy` and `next_step`. Pass `detail: "full"` only when you need the raw inspections.
+   - `verdict` covers **files only**.
+   - `ready_for_intent` also requires the toolchain. For build, run and test, it compares Flutter and Dart on both sides with the pubspec constraints and the fvm pin, read-only.
+   - `toolchain_differs` means the two sides' `pub get` may write different `pubspec.lock` files. Run it on one side, or align the versions with the user. Never upgrade SDKs or dependencies on your own.
+   - `device` and `test_tool` are always `not_checked`. Check simulators and drivers yourself before you rely on them.
 4. If the verdict is not `ready`, follow `suggested_plan` and the `facts`. Never `reset --hard`, `clean`, `checkout --force`, `stash` or delete remote files to make things match. Preserve the user's work and ask when the plan says so.
+   - `destination_dirty` is judged against the **last verified sync**. Files you synced earlier are not someone else's work, even though they are uncommitted there.
+   - Only files that changed on the destination after that sync are protected: `since_verified_sync.remote_only`, or `both`, which is a real conflict.
 5. Transfer with your terminal (scp/sftp/git bundle). Hold `ssh_projects_acquire_lease` while you transfer.
-6. `ssh_projects_verify_sync` with the `source_snapshot` and `generations` from preflight. Your own report of "copied OK" is not evidence. Build only after `verified`/`ready`, and re-run preflight before the next build (readiness expires after ~60 s).
+6. `ssh_projects_verify_sync` with the `source_snapshot` and `generations` from preflight. Your own report of "copied OK" is not evidence.
+   - `partial` means some files arrived, for example after a dropped connection. Retry the copy and verify again.
+   - Build only after `verified`/`ready`, and re-run preflight before the next build (readiness expires after ~60 s).
 
 ## Other rules
 - A dropped SSH connection does not cancel a remote process. Check before you re-run a mutating command.

@@ -21,12 +21,29 @@ All tool inputs are runtime-validated with Zod (strict objects, so unknown field
 | `ssh_projects_verify_sync` | Re-reads both sides. Returns `verified` only if the source still equals `expected_source_snapshot` and the destination matches it within scope. |
 | `ssh_projects_acquire_lease` / `_release_lease` | Coordination only, not a filesystem lock. |
 
-Error codes: `VALIDATION_ERROR NOT_FOUND REVISION_CONFLICT IDEMPOTENCY_CONFLICT SSH_NOT_INSTALLED ENVIRONMENT_MISMATCH DNS_FAILED CONNECTION_REFUSED CONNECTION_TIMEOUT NETWORK_UNREACHABLE AUTH_REQUIRED TRUST_REQUIRED HOST_KEY_CHANGED PROBE_UNSUPPORTED REMOTE_COMMAND_FAILED OUTPUT_LIMIT CHECK_IN_PROGRESS LEASE_HELD DATABASE_BUSY SCHEMA_TOO_NEW INTERNAL_ERROR`.
+Error codes: `VALIDATION_ERROR NOT_FOUND REVISION_CONFLICT IDEMPOTENCY_CONFLICT SSH_NOT_INSTALLED ENVIRONMENT_MISMATCH DNS_FAILED CONNECTION_REFUSED CONNECTION_TIMEOUT NETWORK_UNREACHABLE AUTH_REQUIRED TRUST_REQUIRED HOST_KEY_CHANGED PROBE_UNSUPPORTED REMOTE_COMMAND_FAILED OUTPUT_LIMIT CHECK_IN_PROGRESS LEASE_HELD PATH_OVERLAP DATABASE_BUSY SCHEMA_TOO_NEW INTERNAL_ERROR`.
 
 ## Preflight
 - **Verdict priority:** `path_unset, path_missing, unsupported_layout, wrong_repository, conflicts_present, source_changed, destination_dirty, branch_mismatch, revision_mismatch, identity_unverified, content_mismatch, needs_recheck, ready`.
 - **Identity:** Git root commits. A folder name or remote URL is never proof. A mismatch needs an explicit `confirm_identity`.
-- **Snapshot:** `sha256(HEAD | manifest digest | policy)`. The manifest holds relative path, type (file/symlink) and sha256 of the bytes. Bytes are compared exactly, so CRLF vs LF counts as a difference.
+- **Snapshot:** `sha256(HEAD | manifest digest | policy)`. The manifest holds the relative path, the type (file/symlink), the sha256 of the bytes and, in a Git repo, the Git blob id.
+  - When both sides are Git repos, files are compared by blob id. CRLF vs LF checkouts of one commit match, and byte-only differences are reported as `filter_only_differences`.
+  - Clean files take their blob id from the index. Only dirty and untracked files are re-read with `hash-object`.
+- **Working setups (migration 5):** an execution location may set its own `source_location_id`, which is a non-primary source folder on this PC; `null` means the project's primary source.
+  - Preflight and verify always use the destination's own pair.
+  - `bind_location` with `source_path` reuses a source that has the same path, or creates a new one.
+  - Unbinding a setup's last destination also removes its own source record.
+  - At bind or update time, an execution path equal to, inside, or containing another location's path on the same machine fails with `PATH_OVERLAP`.
+- **Changes since the last verified sync:** the baseline is the pair of manifests the manager read at the last `verified` sync of this setup.
+  - Each differing path is classed `local_only`, `remote_only` or `both`.
+  - `destination_dirty` blocks only `remote_only` and `both`. With no baseline yet, it falls back to "uncommitted on the destination and different from the source".
+- **Readiness:** `verdict` covers files only. `summary.readiness` = `{connection, files, toolchain, device, test_tool}`.
+  - Anything not probed is `not_checked`.
+  - `toolchain` (intents build/run/test) is one of `ok`, `differs`, `incompatible`, `missing`, `not_checked` or `not_applicable`.
+    - It is computed from the shallowest `pubspec.yaml`: environment `sdk`/`flutter` constraints and the `.fvmrc` pin.
+    - It reads the SDKs from `bin/cache/flutter.version.json`, or from `flutter --version --machine` when that file is missing. It never runs `pub get`.
+  - `ready_for_intent` is false when the toolchain is `missing` or `incompatible`.
+- **Output:** `detail: "summary"` (the default) leaves out the raw per-side inspections, and `"full"` includes them.
 - **Scope:** `git ls-files --cached --others --exclude-standard` (tracked plus non-ignored untracked files). Credentials (`.env*`, `*.pem`, keys) are always excluded. Non-Git projects also exclude `node_modules`, `build`, `dist`, `Pods`, `.dart_tool`, `.gradle`, `DerivedData`, `__pycache__`, `.venv` and `.git`. Project-specific globs go in `policy.exclusions`.
 - **Stale files:** a destination file that a previous verified sync copied but the source no longer has is reported as stale-owned. Unknown extra files block `ready` until the user decides.
 - **Default policy:** `source_snapshot` mode, same branch required, detached HEAD blocked, readiness valid for 60 s.

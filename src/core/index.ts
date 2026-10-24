@@ -95,7 +95,8 @@ function exportData(ctx: Ctx) {
   });
   const projs = projects.listProjects(ctx.db).projects.map((p) => ({
     name: p.name, description: p.description,
-    locations: p.locations.map((l) => ({ role: l.role, host_export_id: l.host_id, path: l.path_input, mode: l.mode, label: l.label, policy: l.policy,
+    locations: p.locations.filter((l) => l.role === 'execution' || l.id === p.source_location_id).map((l) => ({ role: l.role, host_export_id: l.host_id, path: l.path_input, mode: l.mode, label: l.label, policy: l.policy,
+      source_path: l.source_location_id && l.source_location_id !== p.source_location_id ? p.locations.find((x) => x.id === l.source_location_id)?.path_input ?? null : null,
       path_note: 'Machine-specific reference from the exporting PC; review after import.' })),
   }));
   return { format: 'ssh-resource-manager-export', version: EXPORT_VERSION, exported_at: now(), hosts, projects: projs };
@@ -105,7 +106,7 @@ const ImportDoc = z.object({
   format: z.literal('ssh-resource-manager-export'), version: z.literal(EXPORT_VERSION),
   hosts: z.array(z.object({ export_id: z.string(), profile: Profile, metadata: z.record(z.string(), z.unknown()), capabilities: z.array(z.unknown()) })).max(1000),
   projects: z.array(z.object({ name: z.string(), description: z.string(), locations: z.array(z.object({ role: z.enum(['source', 'execution']), host_export_id: z.string().nullable(),
-    path: z.string().nullable(), mode: z.enum(['adopt_existing', 'create_if_missing']), label: z.string(), policy: z.unknown() })) })).max(1000),
+    path: z.string().nullable(), mode: z.enum(['adopt_existing', 'create_if_missing']), label: z.string(), policy: z.unknown(), source_path: z.string().nullable().optional() })) })).max(1000),
 }).passthrough();
 
 function previewImport(ctx: Ctx, raw: unknown) {
@@ -134,7 +135,7 @@ function applyImport(ctx: Ctx, raw: unknown, key: string) {
     let rev = created.project.revision;
     for (const [j, l] of p.locations.filter((x) => x.role === 'execution').entries()) {
       if (l.host_export_id && !idMap.has(l.host_export_id)) continue;
-      projects.bindProjectLocation(ctx, { project_id: created.project.id, expected_project_revision: rev++, idempotency_key: `${key}:p${i}l${j}`, ...loc(l) });
+      projects.bindProjectLocation(ctx, { project_id: created.project.id, expected_project_revision: rev++, idempotency_key: `${key}:p${i}l${j}`, ...loc(l), ...(l.source_path ? { source_path: l.source_path } : {}) });
     }
   }
   tx(ctx.db, () => ctx.db.prepare("INSERT INTO audit_events(timestamp, source, action, details_json) VALUES(?,?,'import',?)").run(now(), ctx.source, JSON.stringify({ hosts: doc.hosts.length, projects: doc.projects.length })));

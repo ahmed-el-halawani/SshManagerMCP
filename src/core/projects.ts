@@ -10,6 +10,7 @@ import { audit, checkIdempotency, getHostRow, recordIdempotency } from './hosts.
 import { executionEnvironment } from './paths.ts';
 import { ConsistencyPolicy, IdemKey, LocationSpec } from './schemas.ts';
 import { getSettings } from './settings.ts';
+import { checkToolchain, projectRequirements } from './toolchain.ts';
 import { classify, diagnostics, posixQuote, run, sanitize, splitCommand } from './ssh.ts';
 
 // ---------------- registry ----------------
@@ -19,6 +20,8 @@ type LocationRow = {
   path_input: string | null; canonical_path: string | null; path_flavor: 'windows' | 'posix'; mode: string; role: string;
   enabled: number; revision: number; location_generation: number; git_root: string | null; project_subdirectory: string | null;
   identity_state: string; last_inspection_id: string | null; consistency_policy_json: string; last_verified_sync_id: string | null;
+  /** execution only: the source folder this working setup syncs from; null = the project's primary source */
+  source_location_id: string | null;
 };
 type ProjectRow = { id: string; name: string; description: string; source_location_id: string | null; repository_identity_json: string | null; repo_subdirectory: string | null; revision: number; created_at: string; updated_at: string };
 
@@ -41,8 +44,28 @@ function validatePath(path: string, flavor: 'windows' | 'posix') {
   }
 }
 
-function insertLocation(db: DB, projectId: string, spec: z.infer<typeof LocationSpec>, role: 'source' | 'execution') {
-  let flavor: 'windows' | 'posix' = process.platform === 'win32' ? 'windows' : 'posix';
+const localFlavor = (): 'windows' | 'posix' => (process.platform === 'win32' ? 'windows' : 'posix');
+const normPath = (p: string, flavor: 'windows' | 'posix') => (flavor === 'windows' ? p.replaceAll('\\', '/').toLowerCase() : p).replace(/\/+$/, '');
+
+/** Two working setups must never share (or nest) an execution folder: one sync would rewrite the other's files. */
+function assertNoOverlap(db: DB, hostId: string | null, flavor: 'windows' | 'posix', path: string, exceptId: string | null) {
+  const c = normPath(path, flavor);
+  const rows = db.prepare(`SELECT l.id, l.label, l.path_input, l.canonical_path, p.name FROM project_locations l JOIN projects p ON p.id=l.project_id
+    WHERE l.id IS NOT ? AND ((l.host_id IS NULL AND ? IS NULL) OR l.host_id=?)`).all(exceptId, hostId, hostId) as { id: string; label: string; path_input: string | null; canonical_path: string | null; name: string }[];
+  for (const o of rows) {
+    for (const op of [o.path_input, o.canonical_path]) {
+      if (!op) continue;
+      const oc = normPath(op, flavor);
+      if (oc === c || oc.startsWith(c + '/') || c.startsWith(oc + '/')) {
+        throw new AppError('PATH_OVERLAP', `${path} ${oc === c ? 'is the same folder as' : 'overlaps'} ${op} (project "${o.name}"${o.label ? `, ${o.label}` : ''}). Each working setup needs its own folder.`,
+          { details: { conflicting_location_id: o.id }, next_action: 'Choose a separate folder, or update the existing location if that setup really moved.' });
+      }
+    }
+  }
+}
+
+function insertLocation(db: DB, projectId: string, spec: z.infer<typeof LocationSpec>, role: 'source' | 'execution', pairedSource: string | null = null) {
+  let flavor = localFlavor();
   let env: string = executionEnvironment();
   if (spec.host_id) {
     const h = getHostRow(db, spec.host_id);
@@ -50,10 +73,11 @@ function insertLocation(db: DB, projectId: string, spec: z.infer<typeof Location
     env = `remote:${h.observed_os ?? h.declared_os}`;
   }
   if (spec.path) validatePath(spec.path, flavor);
+  if (spec.path && role === 'execution') assertNoOverlap(db, spec.host_id, flavor, spec.path, null);
   const id = randomUUID();
   const t = now();
-  db.prepare(`INSERT INTO project_locations(id, project_id, host_id, execution_environment, label, path_input, path_flavor, mode, role, consistency_policy_json, created_at, updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, projectId, spec.host_id, env, spec.label, spec.path ?? null, flavor, spec.mode, role, JSON.stringify(ConsistencyPolicy.parse(spec.policy ?? {})), t, t);
+  db.prepare(`INSERT INTO project_locations(id, project_id, host_id, execution_environment, label, path_input, path_flavor, mode, role, consistency_policy_json, source_location_id, created_at, updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, projectId, spec.host_id, env, spec.label, spec.path ?? null, flavor, spec.mode, role, JSON.stringify(ConsistencyPolicy.parse(spec.policy ?? {})), pairedSource, t, t);
   return id;
 }
 
@@ -65,6 +89,7 @@ function locationDto(db: DB, l: LocationRow) {
   const attempt = db.prepare('SELECT outcome, started_at FROM sync_verifications WHERE destination_location_id=? ORDER BY started_at DESC LIMIT 1').get(l.id) ?? null;
   return {
     id: l.id, project_id: l.project_id, host_id: l.host_id, label: l.label, role: l.role, mode: l.mode, enabled: !!l.enabled,
+    source_location_id: l.role === 'execution' ? l.source_location_id ?? getProjectRow(db, l.project_id).source_location_id : null,
     path_input: l.path_input, canonical_path: l.canonical_path, path_flavor: l.path_flavor, path_state: l.path_input ? (insp?.path_state ?? 'unverified') : 'unset',
     execution_environment: l.execution_environment, revision: l.revision, location_generation: l.location_generation,
     identity_state: l.identity_state, git_root: l.git_root, project_subdirectory: l.project_subdirectory, policy: policyOf(l),
@@ -105,15 +130,35 @@ export function registerProject(ctx: Ctx, raw: unknown) {
   });
 }
 
+/**
+ * The source folder a new execution location pairs with. A different local folder of the same project
+ * (another branch/worktree) becomes its own source, so each working setup syncs independently.
+ */
+function pairSource(db: DB, p: ProjectRow, sourceLocationId: string | undefined, sourcePath: string | undefined, label: string) {
+  if (sourceLocationId) {
+    const s = getLocationRow(db, sourceLocationId);
+    if (s.project_id !== p.id || s.role !== 'source') throw new AppError('VALIDATION_ERROR', 'source_location_id must be a source location of this project');
+    return s.id === p.source_location_id ? null : s.id;
+  }
+  if (!sourcePath) return null;
+  validatePath(sourcePath, localFlavor());
+  const sources = db.prepare("SELECT id, path_input FROM project_locations WHERE project_id=? AND role='source' AND host_id IS NULL").all(p.id) as { id: string; path_input: string | null }[];
+  const same = sources.find((s) => s.path_input && normPath(s.path_input, localFlavor()) === normPath(sourcePath, localFlavor()));
+  if (same) return same.id === p.source_location_id ? null : same.id;
+  return insertLocation(db, p.id, LocationSpec.parse({ host_id: null, path: sourcePath, label: label ? `${label} (source)` : 'PC' }), 'source');
+}
+
 export function bindProjectLocation(ctx: Ctx, raw: unknown) {
-  const input = LocationSpec.extend({ project_id: z.uuid(), expected_project_revision: z.number().int(), idempotency_key: IdemKey }).strict().parse(raw);
+  const input = LocationSpec.extend({ project_id: z.uuid(), expected_project_revision: z.number().int(), idempotency_key: IdemKey,
+    source_path: z.string().min(1).max(4096).optional(), source_location_id: z.uuid().optional() }).strict().parse(raw);
   return tx(ctx.db, () => {
     const prev = checkIdempotency(ctx.db, input.idempotency_key, 'bind_project_location', input);
     if (prev) return { location: locationDto(ctx.db, getLocationRow(ctx.db, prev)), replayed: true };
     const p = getProjectRow(ctx.db, input.project_id);
     if (p.revision !== input.expected_project_revision) throw new AppError('REVISION_CONFLICT', 'project changed', { details: { current_revision: p.revision } });
-    const { project_id, expected_project_revision: _r, idempotency_key: _k, ...spec } = input;
-    const id = insertLocation(ctx.db, project_id, spec, 'execution');
+    const { project_id, expected_project_revision: _r, idempotency_key: _k, source_path, source_location_id, ...spec } = input;
+    const paired = pairSource(ctx.db, p, source_location_id, source_path, spec.label);
+    const id = insertLocation(ctx.db, project_id, spec, 'execution', paired);
     ctx.db.prepare('UPDATE projects SET revision=revision+1, updated_at=? WHERE id=?').run(now(), project_id);
     recordIdempotency(ctx.db, input.idempotency_key, 'bind_project_location', input, id);
     audit(ctx.db, ctx.source, 'bind_project_location', input.host_id, null, null, { project_id, location_id: id });
@@ -136,6 +181,7 @@ export function updateProjectLocation(ctx: Ctx, raw: unknown) {
     if (l.revision !== input.expected_revision) throw new AppError('REVISION_CONFLICT', 'location changed; reload', { details: { current_revision: l.revision } });
     const pt = input.patch;
     if (pt.path) validatePath(pt.path, l.path_flavor);
+    if (pt.path && l.role === 'execution') assertNoOverlap(ctx.db, l.host_id, l.path_flavor, pt.path, l.id);
     const pathChanged = pt.path !== undefined && pt.path !== l.path_input;
     const policyChanged = pt.policy !== undefined;
     const invalidate = pathChanged || policyChanged || pt.mode !== undefined;
@@ -162,7 +208,11 @@ export function unbindProjectLocation(ctx: Ctx, raw: unknown) {
     if (l.revision !== input.expected_revision) throw new AppError('REVISION_CONFLICT', 'location changed', { details: { current_revision: l.revision } });
     const p = getProjectRow(ctx.db, l.project_id);
     if (p.source_location_id === l.id) throw new AppError('VALIDATION_ERROR', 'cannot unbind the source location; choose another source first');
+    const users = (id: string) => (ctx.db.prepare('SELECT count(*) n FROM project_locations WHERE source_location_id=?').get(id) as { n: number }).n;
+    if (l.role === 'source' && users(l.id)) throw new AppError('VALIDATION_ERROR', 'this source is used by a working setup; unbind that destination first');
     ctx.db.prepare('DELETE FROM project_locations WHERE id=?').run(l.id);
+    // a setup's own source folder goes with its last destination
+    if (l.source_location_id && !users(l.source_location_id)) ctx.db.prepare('DELETE FROM project_locations WHERE id=?').run(l.source_location_id);
     audit(ctx.db, ctx.source, 'unbind_project_location', l.host_id, l.revision, null, { location_id: l.id });
     return { removed: l.id, note: 'Metadata only. No remote or local directory was touched.' };
   });
@@ -255,16 +305,32 @@ function applyExclusions(files: string[], isRepo: boolean, policy: ConsistencyPo
   return { kept, excluded };
 }
 
+/** Repo-root-relative paths -> relative to the inspected subdirectory. */
+const underSubdir = (paths: string[], sub?: string) => (sub ? paths.filter((p) => p.startsWith(sub + '/')).map((p) => p.slice(sub.length + 1)) : paths);
+
+/** `git ls-files -s -z` -> path -> blob id of the index entry. */
+const parseIndex = (z0: string) => new Map(z0.split('\0').flatMap((l) => {
+  const m = /^\d+ ([0-9a-f]{40,64}) 0\t([\s\S]*)$/.exec(l.replace(/^\n/, ''));
+  return m ? [[m[2], m[1]] as const] : [];
+}));
+
 /**
- * Git blob ids via `git hash-object --stdin-paths`, which applies the repo's eol/clean filters.
- * Windows (autocrlf) and macOS checkouts of the same commit have different bytes but identical blobs.
+ * Git blob ids, which see through the repo's eol/clean filters: Windows (autocrlf) and macOS checkouts
+ * of the same commit have different bytes but identical blobs. A file `git status` just reported clean
+ * has its index blob; only dirty/untracked files are re-read with `git hash-object --stdin-paths`.
  */
-async function addGitBlobIds(entries: Entry[], hash: (input: string) => Promise<{ stdout: string; exit_code: number | null }>) {
-  const files = entries.filter((e) => e.t === 'f' && !e.p.includes('\n'));
+async function addGitBlobIds(entries: Entry[], index: Map<string, string>, dirty: Set<string>, hash: (input: string) => Promise<{ stdout: string; exit_code: number | null }>) {
+  const files: Entry[] = [];
+  for (const e of entries) {
+    if (e.t !== 'f') continue;
+    const id = dirty.has(e.p) ? undefined : index.get(e.p);
+    if (id) e.g = id;
+    else if (!e.p.includes('\n')) files.push(e);
+  }
   if (!files.length) return;
   const r = await hash(files.map((e) => e.p).join('\n') + '\n');
   const ids = r.stdout.split(/\r?\n/).filter((l) => /^[0-9a-f]{40,64}$/.test(l));
-  if (r.exit_code !== 0 || ids.length !== files.length) return; // fall back to byte comparison only
+  if (r.exit_code !== 0 || ids.length !== files.length) return; // these files fall back to byte comparison
   files.forEach((e, i) => { e.g = ids[i]; });
 }
 
@@ -293,6 +359,8 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
   let files: string[];
   const statusOf = async () => (await g(['status', '--porcelain=v2', '-z', '--untracked-files=all', '--', '.'], 32 << 20)).stdout;
   let statusBefore = '';
+  let index = new Map<string, string>();
+  let dirty = new Set<string>();
   if (isRepo) {
     const top = (await g(['rev-parse', '--show-toplevel'])).stdout.trim();
     statusBefore = await statusOf();
@@ -306,8 +374,11 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
       ...parseStatus(statusBefore),
     };
     facts.detached = !facts.branch;
+    facts.dirty_paths = underSubdir(facts.dirty_paths, facts.subdir); // porcelain paths are repo-root relative, manifests cwd-relative
+    dirty = new Set(facts.dirty_paths);
     facts.dirty_paths = facts.dirty_paths.slice(0, 50);
     files = (await g(['ls-files', '-z', '--cached', '--others', '--exclude-standard'], 64 << 20)).stdout.split('\0').filter(Boolean);
+    index = parseIndex((await g(['ls-files', '-s', '-z'], 64 << 20)).stdout);
   } else {
     files = [];
     const walk = (rel: string) => {
@@ -330,7 +401,7 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
       else if (ls.isFile()) entries.push({ p: f, t: 'f', h: sha(readFileSync(abs)) }); // ponytail: whole-file read; stream if multi-GB assets matter
     } catch { /* tracked but deleted in working tree: not part of content */ }
   }
-  if (isRepo) await addGitBlobIds(entries, (input) => g(['hash-object', '--stdin-paths'], 64 << 20, input));
+  if (isRepo) await addGitBlobIds(entries, index, dirty, (input) => g(['hash-object', '--stdin-paths'], 64 << 20, input));
   const stable = !isRepo || (await statusOf()) === statusBefore;
   return {
     path_state: 'exists', canonical_path: canonical, git: facts, stable,
@@ -365,12 +436,13 @@ if [ "$G" = 1 ] && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true
   echo "@@REMOTES"; git remote -v 2>/dev/null; echo "@@END"
   printf '@@STATUS\\n'; git -c core.quotepath=off status --porcelain=v2 -z --untracked-files=all -- .; printf '\\n@@END\\n'
   printf '@@FILES\\n'; git -c core.quotepath=off ls-files -z --cached --others --exclude-standard; printf '\\n@@END\\n'
+  printf '@@INDEX\\n'; git -c core.quotepath=off ls-files -s -z; printf '\\n@@END\\n'
   printf '@@STATUS2\\n'; git -c core.quotepath=off status --porcelain=v2 -z --untracked-files=all -- .; printf '\\n@@END\\n'
 else
   echo "@@REPO 0"
   printf '@@FILES\\n'; find . \\( ${prune} \\) -prune -o \\( -type f -o -type l \\) -print0; printf '\\n@@END\\n'
 fi
-printf '@@LINKS\\n'; find . -path ./.git -prune -o -type l -print 2>/dev/null | while IFS= read -r l; do printf '%s\\t%s\\n' "$l" "$(readlink "$l")"; done; printf '@@END\\n'
+printf '@@LINKS\\n'; find . \\( ${prune} \\) -prune -o -type l -print 2>/dev/null | while IFS= read -r l; do printf '%s\\t%s\\n' "$l" "$(readlink "$l")"; done; printf '@@END\\n'
 `;
 }
 
@@ -405,6 +477,7 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
   const isRepo = field(out, 'REPO') === '1';
   let facts: GitFacts = { available: field(out, 'GIT') === '1', is_repo: isRepo, staged: 0, unstaged: 0, untracked: 0, conflicts: 0, dirty_paths: [] };
   const status = section(out, 'STATUS');
+  let dirty = new Set<string>();
   if (isRepo) {
     facts = {
       ...facts, root: field(out, 'TOP'), subdir: (field(out, 'PREFIX') ?? '').replace(/\/$/, ''),
@@ -414,6 +487,8 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
       git_dir_is_file: field(out, 'GITDIRFILE') === '1', ...parseStatus(status),
     };
     facts.detached = !facts.branch;
+    facts.dirty_paths = underSubdir(facts.dirty_paths, facts.subdir); // porcelain paths are repo-root relative, manifests cwd-relative
+    dirty = new Set(facts.dirty_paths);
     facts.dirty_paths = facts.dirty_paths.slice(0, 50);
   }
   const files = section(out, 'FILES').split('\0').map((f) => f.replace(/^\.\//, '')).filter(Boolean);
@@ -441,7 +516,7 @@ xargs -0 $H 2>/dev/null; echo "@@DONE"`;
   const keptSet = new Set(kept);
   const scopedLinks = links.filter((x) => keptSet.has(x.p)); // ignored build output (ios/.symlinks, ephemeral/) is out of scope
   for (const l of scopedLinks) entries.push({ p: l.p, t: 'l', h: sha(l.target) });
-  if (isRepo) await addGitBlobIds(entries, (input) => sshRun(ctx, host, `cd -- ${posixQuote(canonical)} && git hash-object --stdin-paths`, s.inspect_timeout_s, { maxBytes: 64 << 20, input }));
+  if (isRepo) await addGitBlobIds(entries, parseIndex(section(out, 'INDEX')), dirty, (input) => sshRun(ctx, host, `cd -- ${posixQuote(canonical)} && git hash-object --stdin-paths`, s.inspect_timeout_s, { maxBytes: 64 << 20, input }));
   return {
     path_state: 'exists', canonical_path: canonical, home, git: facts, stable: !isRepo || section(out, 'STATUS2') === status,
     layout_issues: layoutIssues(kept, scopedLinks, keptSet.has('.gitmodules'), false), manifest: finishManifest(entries, excluded),
@@ -480,7 +555,7 @@ async function inspectLocation(ctx: Ctx, project: ProjectRow, l: LocationRow): P
 
 function identityState(db: DB, project: ProjectRow, l: LocationRow, insp: Inspection) {
   if (l.identity_state === 'user_confirmed' || l.identity_state === 'content_verified') return l.identity_state;
-  if (l.id === project.source_location_id) return insp.path_state === 'exists' ? 'source' : 'unverified';
+  if (l.role === 'source') return insp.path_state === 'exists' ? 'source' : 'unverified';
   const fresh = getProjectRow(db, project.id);
   const ident = fresh.repository_identity_json ? JSON.parse(fresh.repository_identity_json) as { root_commits?: string[] } : null;
   if (!insp.git?.is_repo || !ident?.root_commits?.length) return 'unverified';
@@ -597,7 +672,8 @@ export async function inspectProject(ctx: Ctx, raw: unknown) {
   const locs = (ctx.db.prepare('SELECT * FROM project_locations WHERE project_id=?').all(project.id) as LocationRow[])
     .filter((l) => !input.location_ids || input.location_ids.includes(l.id));
   // source first so the repository identity exists before destinations are compared
-  locs.sort((a, b) => (a.id === project.source_location_id ? -1 : b.id === project.source_location_id ? 1 : 0));
+  const rank = (l: LocationRow) => (l.id === project.source_location_id ? 0 : l.role === 'source' ? 1 : 2);
+  locs.sort((a, b) => rank(a) - rank(b));
   const results = [];
   for (const l of locs) results.push({ location_id: l.id, ...summarize(await inspectLocation(ctx, project, l)) });
   return { project_id: project.id, inspected_at: now(), results, note: 'Read-only. No fetch, pull, checkout, mkdir or writes were performed.' };
@@ -626,13 +702,24 @@ function overlapFacts(db: DB, l: LocationRow, canonical: string | undefined, hom
 
 const readManifest = (db: DB, inspectionId: string): Entry[] => {
   const r = db.prepare('SELECT manifest_ref FROM inspections WHERE id=?').get(inspectionId) as { manifest_ref: string | null } | undefined;
-  return r?.manifest_ref ? JSON.parse(readFileSync(r.manifest_ref, 'utf8')) : [];
+  try { return r?.manifest_ref ? JSON.parse(readFileSync(r.manifest_ref, 'utf8')) : []; } catch { return []; } // a lost manifest makes every file look changed: the safe side
 };
 
-function compare(db: DB, project: ProjectRow, dest: LocationRow, src: Inspection, dst: Inspection, policy: ConsistencyPolicy) {
+/** Both sides as the manager read them at the last verified sync of this setup (path -> byte hash). */
+function verifiedBaseline(db: DB, dest: LocationRow, srcId: string) {
+  if (!dest.last_verified_sync_id) return null;
+  const v = db.prepare('SELECT source_location_id, evidence_json FROM sync_verifications WHERE id=?').get(dest.last_verified_sync_id) as { source_location_id: string; evidence_json: string } | undefined;
+  const ev = v ? JSON.parse(v.evidence_json) as { source_inspection_id?: string; destination_inspection_id?: string } : {};
+  if (!v || !ev.source_inspection_id || !ev.destination_inspection_id) return null;
+  const hashes = (id: string) => new Map(readManifest(db, id).map((e) => [e.p, e.h]));
+  return { same_source: v.source_location_id === srcId, src: hashes(ev.source_inspection_id), dst: hashes(ev.destination_inspection_id) };
+}
+
+function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, src: Inspection, dst: Inspection, policy: ConsistencyPolicy) {
   const facts: Fact[] = [];
   const add = (kind: string, detail: string, paths?: string[], blocking = true) => facts.push({ kind, blocking, detail, ...(paths ? { paths: paths.slice(0, 50) } : {}) });
-  const diff = { missing: [] as string[], changed: [] as string[], extra_owned: [] as string[], extra_unknown: [] as string[], filtered_only: [] as string[] };
+  const diff = { missing: [] as string[], changed: [] as string[], extra_owned: [] as string[], extra_unknown: [] as string[], filtered_only: [] as string[],
+    since_verified_sync: null as null | { local_only: string[]; remote_only: string[]; both: string[] } };
   if (dst.path_state === 'unset') { add('path_unset', 'destination path is not set'); return { facts, diff }; }
   if (src.path_state !== 'exists') { add('path_missing', `source path state: ${src.path_state}`); return { facts, diff }; }
   if (dst.error) { add('needs_recheck', `${dst.error.code}: ${dst.error.message}`); return { facts, diff }; }
@@ -664,12 +751,8 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, src: Inspection
   // content
   const sm = new Map(src.manifest!.entries.map((e) => [e.p, e]));
   const dm = new Map(dst.manifest!.entries.map((e) => [e.p, e]));
-  const owned = new Set<string>();
-  if (dest.last_verified_sync_id) {
-    const v = db.prepare('SELECT evidence_json FROM sync_verifications WHERE id=?').get(dest.last_verified_sync_id) as { evidence_json: string } | undefined;
-    const ref = v ? JSON.parse(v.evidence_json).source_inspection_id : null;
-    if (ref) for (const e of readManifest(db, ref)) owned.add(e.p);
-  }
+  const base = verifiedBaseline(db, dest, srcId);
+  const owned = new Set(base?.src.keys() ?? []);
   // A non-Git destination is listed with the non-Git exclusions (build/, node_modules/...). Source files
   // in those paths (e.g. a committed build report) can never be compared there: report, don't block.
   const outOfScope = sg?.is_repo && !dg?.is_repo ? [...sm.keys()].filter((p) => NON_GIT_EXCLUDES.some((g) => matchesGlob(p, g))) : [];
@@ -685,8 +768,24 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, src: Inspection
   if (diff.filtered_only.length) {
     add('filter_only_differences', `${diff.filtered_only.length} file(s) differ only in bytes Git normalises (line endings / clean filters); compared by Git blob id, same content`, diff.filtered_only, false);
   }
-  const destDirtyAtRisk = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
-  if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten', destDirtyAtRisk);
+  const differing = [...diff.changed, ...diff.missing, ...diff.extra_owned, ...diff.extra_unknown];
+  if (base) {
+    // Who changed what since the manager last verified this setup. Uncommitted files we synced are not
+    // someone else's work; a destination file that no longer matches what we verified there is.
+    const since = { local_only: [] as string[], remote_only: [] as string[], both: [] as string[] };
+    for (const p of differing) {
+      const local = !base.same_source || base.src.get(p) !== sm.get(p)?.h;
+      const remote = base.dst.get(p) !== dm.get(p)?.h;
+      (remote ? (local ? since.both : since.remote_only) : since.local_only).push(p);
+    }
+    diff.since_verified_sync = since;
+    if (differing.length) add('changes_since_verified_sync', `since the last verified sync: ${since.local_only.length} changed on source only, ${since.remote_only.length} on destination only, ${since.both.length} on both`, undefined, false);
+    const atRisk = [...since.both, ...since.remote_only];
+    if (atRisk.length) add('destination_dirty', `${atRisk.length} file(s) changed on the destination after the last verified sync (${since.both.length} also changed on source = conflict); copying would overwrite that work`, atRisk);
+  } else {
+    const destDirtyAtRisk = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
+    if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten (no verified sync yet to tell who changed it)', destDirtyAtRisk);
+  }
   if (diff.missing.length || diff.changed.length || diff.extra_owned.length || diff.extra_unknown.length) {
     add('content_mismatch', `missing ${diff.missing.length}, changed ${diff.changed.length}, stale-owned ${diff.extra_owned.length}, unknown extra ${diff.extra_unknown.length}`,
       [...diff.changed, ...diff.missing, ...diff.extra_owned, ...diff.extra_unknown]);
@@ -737,34 +836,59 @@ function locationsFor(db: DB, projectId: string, destinationId: string) {
   if (!project.source_location_id) throw new AppError('VALIDATION_ERROR', 'project has no source location');
   const dest = getLocationRow(db, destinationId);
   if (dest.project_id !== project.id) throw new AppError('VALIDATION_ERROR', 'location belongs to another project');
-  if (dest.id === project.source_location_id) throw new AppError('VALIDATION_ERROR', 'destination equals source');
-  return { project, src: getLocationRow(db, project.source_location_id), dest };
+  if (dest.role !== 'execution') throw new AppError('VALIDATION_ERROR', 'destination must be an execution location, not a source');
+  return { project, src: getLocationRow(db, dest.source_location_id ?? project.source_location_id), dest };
 }
 
 function leaseInfo(db: DB, locationId: string) {
   return db.prepare('SELECT owner, operation_id, expires_at FROM project_operation_leases WHERE destination_location_id=? AND expires_at>?').get(locationId, now()) ?? null;
 }
 
+const NOT_CONNECTION = ['MACOS_PRIVACY_BLOCKED', 'PROBE_UNSUPPORTED'];
+
 export async function preflightProject(ctx: Ctx, raw: unknown) {
-  const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid(), expected_source_snapshot: z.string().optional(), intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).default('build') }).strict().parse(raw);
+  const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid(), expected_source_snapshot: z.string().optional(),
+    intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).default('build'), detail: z.enum(['summary', 'full']).default('summary') }).strict().parse(raw);
   const { project, src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
   const s = await inspectLocation(ctx, project, src);
   const d = await inspectLocation(ctx, getProjectRow(ctx.db, project.id), dest);
   const policy = policyOf(dest);
-  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), s.inspection, d.inspection, policy);
+  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, policy);
   if (input.expected_source_snapshot && input.expected_source_snapshot !== s.snapshot_id) facts.push({ kind: 'source_changed', blocking: true, detail: `source snapshot is now ${s.snapshot_id}, expected ${input.expected_source_snapshot}` });
   const lease = leaseInfo(ctx.db, dest.id);
   if (lease) facts.push({ kind: 'lease_held', blocking: false, detail: `an operation lease is held: ${JSON.stringify(lease)}` });
   const verdict = verdictOf(facts);
-  const t = now();
+
+  // Readiness is per concern: in-sync files say nothing about SDKs, devices or test drivers.
+  const connectionFailed = !!dest.host_id && !!d.inspection.error && !NOT_CONNECTION.includes(d.inspection.error.code);
+  const wantsTools = ['build', 'run', 'test'].includes(input.intent);
+  // the app may live in a subfolder of the repo (e.g. quran_coach/pubspec.yaml): take the shallowest pubspec
+  const pubspec = s.inspection.manifest?.entries.map((e) => e.p).filter((p) => p === 'pubspec.yaml' || p.endsWith('/pubspec.yaml'))
+    .sort((a, b) => a.split('/').length - b.split('/').length)[0];
+  const appDir = pubspec && s.inspection.canonical_path && !src.host_id ? join(s.inspection.canonical_path, posix.dirname(pubspec)) : null;
+  const toolchain = !wantsTools ? { state: 'not_checked' as const, facts: [], note: `intent '${input.intent}' does not build` }
+    : connectionFailed ? { state: 'not_checked' as const, facts: [], note: 'destination unreachable' }
+    : { ...await checkToolchain(ctx, appDir ? projectRequirements(appDir) : null, dest.host_id), ...(pubspec ? { pubspec } : {}) };
+  facts.push(...toolchain.facts);
+  const readiness = { connection: !dest.host_id ? 'local' : connectionFailed ? 'failed' : 'ok', files: verdict === 'ready' ? 'in_sync' : verdict,
+    toolchain: toolchain.state, device: 'not_checked', test_tool: 'not_checked' };
+  const toolsOk = !wantsTools || !['missing', 'incompatible'].includes(toolchain.state);
+  const plan = suggestPlan(verdict, s.inspection, d.inspection, dest, diff);
+  const side = (l: LocationRow, r: typeof s) => ({ location_id: l.id, label: l.label, host_id: l.host_id, path: r.inspection.canonical_path ?? l.path_input,
+    branch: r.inspection.git?.branch ?? null, head: r.inspection.git?.head?.slice(0, 12) ?? null,
+    uncommitted: r.inspection.git?.is_repo ? r.inspection.git.staged + r.inspection.git.unstaged + r.inspection.git.untracked : null });
   return {
-    verdict, intent: input.intent, facts, source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
+    verdict, ready_for_intent: verdict === 'ready' && toolsOk, intent: input.intent,
+    summary: { setup: dest.label || null, source: side(src, s), destination: side(dest, d), readiness, files_to_copy: (plan as { copy_count?: number }).copy_count ?? 0,
+      since_verified_sync: diff.since_verified_sync && Object.fromEntries(Object.entries(diff.since_verified_sync).map(([k, v]) => [k, v.length])), lease,
+      next_step: verdict === 'ready' && !toolsOk ? `Toolchain ${toolchain.state}: ${toolchain.facts[0]?.detail ?? toolchain.state}` : plan.steps[0] },
+    facts, source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
     generations: { source: src.location_generation, destination: dest.location_generation },
-    evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t,
+    evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: now(),
     ready_until: verdict === 'ready' ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
-    suggested_plan: suggestPlan(verdict, s.inspection, d.inspection, dest, diff),
-    source: summarize(s), destination: summarize(d),
-    note: 'Readiness is evidence at a point in time, not a lock. External edits after this check are not prevented.',
+    suggested_plan: plan, toolchain,
+    ...(input.detail === 'full' ? { source: summarize(s), destination: summarize(d) } : {}),
+    note: 'verdict covers files only; check readiness for toolchain/device. Readiness is evidence at a point in time, not a lock. device/test_tool are not_checked: probe them yourself. Pass detail:"full" for raw inspections.',
   };
 }
 
@@ -795,7 +919,7 @@ export async function verifyProjectSync(ctx: Ctx, raw: unknown) {
     return { verification_id: id, outcome: 'needs_recheck', reason: 'source changed after preflight; the transferred content may be stale', source_snapshot: s.snapshot_id };
   }
   const d = await inspectLocation(ctx, project, dest);
-  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), s.inspection, d.inspection, policyOf(dest));
+  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, policyOf(dest));
   const verdict = verdictOf(facts);
   const matched = s.inspection.manifest!.count - diff.missing.length - diff.changed.length;
   const outcome = verdict === 'ready' ? 'verified' : d.inspection.error ? 'needs_recheck' : matched > 0 && matched < s.inspection.manifest!.count ? 'partial' : 'failed';

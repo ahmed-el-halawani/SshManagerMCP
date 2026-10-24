@@ -5,11 +5,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { before, test } from 'node:test';
 import type { Core } from '../src/core/index.ts';
+import { evaluateToolchain, projectRequirements, satisfies } from '../src/core/toolchain.ts';
 import { cloneTo, git, key, makeCore, posixPath, tempRepo } from './helpers.ts';
 
 before(() => { process.env.FAKE_SSH_MODE = 'sh'; });
 
-type Pre = { verdict: string; facts: { kind: string; blocking: boolean; paths?: string[] }[]; source_snapshot: string; generations: { source: number; destination: number }; suggested_plan: { kind: string; copy?: string[] } };
+type Pre = { verdict: string; facts: { kind: string; blocking: boolean; paths?: string[] }[]; source_snapshot: string; generations: { source: number; destination: number }; suggested_plan: { kind: string; copy?: string[] };
+  summary: { setup: string | null; readiness: Record<string, string>; since_verified_sync: { local_only: number; remote_only: number; both: number } | null } };
+type Verify = { outcome: string };
 
 function setup(srcDir: string, dstDir: string | null, core: Core = makeCore()) {
   const host = core.registerHost({ profile: { mode: 'direct', hostname: 'mac.lan', port: 22, username: 'dev' }, metadata: { name: 'mac', declared_os: 'linux' }, idempotency_key: key() }).host;
@@ -146,10 +149,8 @@ test('nested/overlapping locations and home-root destinations are rejected befor
   const dst = cloneTo(src);
   const { core, project, host } = setup(src, dst);
   const p = core.getProject({ project_id: project.id });
-  const nested = core.bindProjectLocation({ project_id: project.id, host_id: host.id, path: posixPath(join(dst, 'src')), expected_project_revision: p.revision, idempotency_key: key() }).location;
-  await core.inspectProject({ project_id: project.id });
-  const r = await core.preflightProject({ project_id: project.id, destination_location_id: nested.id }) as Pre;
-  assert.ok(r.facts.some((f) => f.kind === 'unsupported_layout'), JSON.stringify(r.facts));
+  assert.throws(() => core.bindProjectLocation({ project_id: project.id, host_id: host.id, path: posixPath(join(dst, 'src')), expected_project_revision: p.revision, idempotency_key: key() }), /overlaps/);
+  assert.throws(() => core.bindProjectLocation({ project_id: project.id, host_id: host.id, path: posixPath(dst) + '/', expected_project_revision: p.revision, idempotency_key: key() }), /same folder/);
   const p2 = core.getProject({ project_id: project.id });
   const home = core.bindProjectLocation({ project_id: project.id, host_id: host.id, path: '~', expected_project_revision: p2.revision, idempotency_key: key() }).location;
   const h = await core.preflightProject({ project_id: project.id, destination_location_id: home.id }) as Pre;
@@ -213,4 +214,124 @@ test('non-Git project uses a manifest; caches and credentials excluded on both s
   assert.equal(r.verdict, 'ready', JSON.stringify(r.facts));
   writeFileSync(join(dst, 'main.c'), 'int main(){return 1;}\n');
   assert.equal((await pre()).verdict, 'content_mismatch');
+});
+
+/** The "agent" copies the planned files, then the manager verifies. */
+async function syncOnce(core: Core, project: { id: string }, loc: { id: string }, src: string, dst: string, pre: () => Promise<Pre>, only?: number) {
+  const r = await pre();
+  for (const f of (r.suggested_plan.copy ?? []).slice(0, only)) { mkdirSync(dirname(join(dst, f)), { recursive: true }); copyFileSync(join(src, f), join(dst, f)); }
+  return { r, v: await core.verifyProjectSync({ project_id: project.id, destination_location_id: loc.id, expected_source_snapshot: r.source_snapshot, operation_id: key(), expected_generations: r.generations }) as Verify };
+}
+
+test('independent working setups: two local copies on different branches sync to their own folders on one host', async () => {
+  const main = tempRepo();
+  const learning = cloneTo(main, 'learning');
+  git(learning, 'switch', '-q', '-c', 'learning');
+  writeFileSync(join(learning, 'a.txt'), 'learning edit\n');
+  git(learning, 'commit', '-qam', 'learning');
+  const macMain = cloneTo(main, 'mac-main');
+  const macLearning = cloneTo(learning, 'mac-learning');
+  const { core, project, host, loc, pre } = setup(main, macMain);
+  const p = core.getProject({ project_id: project.id });
+  const exp = core.bindProjectLocation({ project_id: project.id, host_id: host.id, path: posixPath(macLearning), label: 'learning', source_path: learning,
+    expected_project_revision: p.revision, idempotency_key: key() }).location;
+  assert.equal(core.getProject({ project_id: project.id }).source_location_id, p.source_location_id, 'the existing source is not changed');
+  assert.notEqual(exp.source_location_id, p.source_location_id);
+  const preExp = () => core.preflightProject({ project_id: project.id, destination_location_id: exp.id }) as Promise<Pre>;
+  assert.equal((await pre()).verdict, 'ready');
+  const e = await preExp();
+  assert.equal(e.verdict, 'ready', JSON.stringify(e.facts));
+  assert.equal(e.summary.setup, 'learning');
+
+  writeFileSync(join(learning, 'src', 'b.txt'), 'experiment wip\n');
+  const { r, v } = await syncOnce(core, project, exp, learning, macLearning, preExp);
+  assert.deepEqual(r.suggested_plan.copy, ['src/b.txt']);
+  assert.equal(v.outcome, 'verified');
+  assert.equal(readFileSync(join(macMain, 'src', 'b.txt'), 'utf8'), 'bee\n', 'the other setup is untouched');
+  assert.equal((await pre()).verdict, 'ready');
+
+  const rev = () => core.getProject({ project_id: project.id }).revision;
+  assert.throws(() => core.bindProjectLocation({ project_id: project.id, host_id: host.id, path: posixPath(join(macLearning, 'lib')), source_path: learning, expected_project_revision: rev(), idempotency_key: key() }), /overlaps/);
+  const locRev = () => core.getProject({ project_id: project.id }).locations.find((l) => l.id === exp.id)!.revision;
+  assert.throws(() => core.updateProjectLocation({ location_id: exp.id, expected_revision: locRev(), patch: { path: posixPath(macMain) }, idempotency_key: key() }), /same folder/);
+  // removing the setup removes its own source record too; the primary mapping stays
+  core.unbindProjectLocation({ location_id: exp.id, expected_revision: locRev() });
+  assert.deepEqual(core.getProject({ project_id: project.id }).locations.map((l) => l.id).sort(), [p.source_location_id, loc.id].sort());
+});
+
+test('after a verified sync, later local edits are not destination work; destination edits are protected', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  writeFileSync(join(src, 'a.txt'), 'first edit\n');
+  const { core, pre, project, loc } = setup(src, dst);
+  assert.equal((await syncOnce(core, project, loc, src, dst, pre)).v.outcome, 'verified'); // a.txt is now uncommitted on the destination
+
+  writeFileSync(join(src, 'a.txt'), 'second edit\n');
+  const local = await pre();
+  assert.equal(local.verdict, 'content_mismatch', JSON.stringify(local.facts));
+  assert.deepEqual(local.summary.since_verified_sync, { local_only: 1, remote_only: 0, both: 0 });
+  assert.equal((await syncOnce(core, project, loc, src, dst, pre)).v.outcome, 'verified');
+
+  writeFileSync(join(dst, 'src', 'b.txt'), 'edited on the mac\n'); // e.g. pub get rewrote a lockfile there
+  const remote = await pre();
+  assert.equal(remote.verdict, 'destination_dirty');
+  assert.deepEqual(remote.summary.since_verified_sync, { local_only: 0, remote_only: 1, both: 0 });
+  writeFileSync(join(src, 'src', 'b.txt'), 'edited on the pc\n');
+  const both = await pre();
+  assert.equal(both.verdict, 'destination_dirty');
+  assert.equal(both.summary.since_verified_sync!.both, 1);
+  assert.equal(readFileSync(join(dst, 'src', 'b.txt'), 'utf8'), 'edited on the mac\n');
+});
+
+test('recovery: interrupted transfer is partial, retry verifies; destination edited after preflight; expired lease', async () => {
+  const src = tempRepo({ 'a.txt': 'a\n', 'b.txt': 'b\n', 'c.txt': 'c\n' });
+  const dst = cloneTo(src);
+  for (const f of ['a.txt', 'b.txt', 'c.txt']) writeFileSync(join(src, f), `${f} v2\n`);
+  const { core, pre, project, loc } = setup(src, dst);
+  core.acquireLease({ location_id: loc.id, operation_id: 'op1', owner: 'agent-a', ttl_seconds: 10 });
+  assert.ok((await pre()).facts.some((f) => f.kind === 'lease_held'));
+
+  const cut = await syncOnce(core, project, loc, src, dst, pre, 1); // connection dropped after one file
+  assert.equal(cut.v.outcome, 'partial');
+  assert.equal((await syncOnce(core, project, loc, src, dst, pre)).v.outcome, 'verified'); // retry copies the rest
+
+  writeFileSync(join(src, 'a.txt'), 'a v3\n');
+  const r = await pre();
+  copyFileSync(join(src, 'a.txt'), join(dst, 'a.txt'));
+  writeFileSync(join(dst, 'a.txt'), 'changed by someone else after the copy\n');
+  const v = await core.verifyProjectSync({ project_id: project.id, destination_location_id: loc.id, expected_source_snapshot: r.source_snapshot, operation_id: 'op1', expected_generations: r.generations }) as Verify;
+  assert.notEqual(v.outcome, 'verified');
+
+  assert.throws(() => core.acquireLease({ location_id: loc.id, operation_id: 'op2', owner: 'agent-b' }), /holds/);
+  core.db.prepare('UPDATE project_operation_leases SET expires_at=?').run(new Date(Date.now() - 1000).toISOString());
+  assert.ok(core.acquireLease({ location_id: loc.id, operation_id: 'op2', owner: 'agent-b' }), 'an expired lease does not block');
+});
+
+test('project in a repo subfolder: clean files use index blob ids, an uncommitted edit is still seen', async () => {
+  const repo = tempRepo({ 'README': 'root\n', 'app/lib/a.dart': 'v1\n', 'app/pubspec.yaml': 'name: app\n' });
+  const clone = cloneTo(repo);
+  const { pre } = setup(join(repo, 'app'), join(clone, 'app'));
+  assert.equal((await pre()).verdict, 'ready');
+  writeFileSync(join(clone, 'app', 'lib', 'a.dart'), 'edited on the mac, not committed\n');
+  const r = await pre();
+  assert.equal(r.verdict, 'destination_dirty', JSON.stringify(r.facts));
+  assert.deepEqual(r.facts.find((f) => f.kind === 'destination_dirty')!.paths, ['lib/a.dart']);
+});
+
+test('toolchain: pubspec constraints, fvm pin and SDK versions on both sides (read-only)', () => {
+  assert.ok(satisfies('3.5.4', '>=3.4.0 <4.0.0'));
+  assert.ok(!satisfies('3.3.9', '>=3.4.0 <4.0.0'));
+  assert.ok(satisfies('3.7.0', '^3.5.0') && !satisfies('4.0.0', '^3.5.0') && !satisfies('0.3.0', '^0.2.1'));
+  assert.ok(satisfies('3.11.0-200.0.dev', '>=3.10.0 <4.0.0'));
+  const dir = mkdtempSync(join(tmpdir(), 'sshrm-pub-'));
+  writeFileSync(join(dir, 'pubspec.yaml'), 'name: app\r\nenvironment:\r\n  sdk: ">=3.10.0 <4.0.0"\r\n  flutter: ">=3.40.0"\r\ndependencies:\r\n  flutter:\r\n    sdk: flutter\r\n');
+  const req = projectRequirements(dir)!;
+  assert.deepEqual(req, { uses_flutter: true, dart: '>=3.10.0 <4.0.0', flutter: '>=3.40.0' });
+  const pc = { flutter: '3.44.8', dart: '3.10.4' };
+  assert.equal(evaluateToolchain(req, pc, { flutter: '3.47.7', dart: '3.11.0' }).state, 'differs');
+  assert.equal(evaluateToolchain(req, pc, { ...pc }).state, 'ok');
+  assert.equal(evaluateToolchain(req, pc, { flutter: '3.35.0', dart: '3.9.0' }).state, 'incompatible');
+  assert.equal(evaluateToolchain(req, pc, null).state, 'missing');
+  writeFileSync(join(dir, '.fvmrc'), '{"flutter":"3.44.8"}');
+  assert.ok(evaluateToolchain(projectRequirements(dir)!, pc, { flutter: '3.47.7', dart: '3.11.0' }).facts.some((f) => f.kind === 'toolchain_pin_mismatch'));
 });

@@ -447,7 +447,7 @@ function HostProjects({ host }: { host: any }) {
       {adding && <NewMapping host={host} projects={projects} onDone={() => { setAdding(false); reload(); }} />}
       {data && mapped.length === 0 && !adding && <p className="muted">No projects mapped to this host yet.</p>}
       {mapped.map((p) => p.locations.filter((l: any) => l.host_id === host.id).map((dest: any) => (
-        <MappingCard key={dest.id} project={p} source={p.locations.find((l: any) => l.id === p.source_location_id)} dest={dest} host={host} reload={reload} />
+        <MappingCard key={dest.id} project={p} source={p.locations.find((l: any) => l.id === dest.source_location_id)} dest={dest} host={host} reload={reload} />
       )))}
     </section>
   );
@@ -459,10 +459,13 @@ function NewMapping({ host, projects, onDone }: { host: any; projects: any[]; on
   const [src, setSrc] = useState('');
   const [dst, setDst] = useState('');
   const [mode, setMode] = useState('adopt_existing');
+  const [setup, setSetup] = useState('');
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const keys = useRef({ p: idem(), l: idem() });
   const existing = projects.find((p) => p.id === projectId);
+  const primary = existing?.locations.find((l: any) => l.id === existing.source_location_id)?.path_input ?? '';
+  const otherSource = !!existing && !!src && src !== primary;
   async function save() {
     setBusy(true); setErr(null);
     try {
@@ -470,7 +473,8 @@ function NewMapping({ host, projects, onDone }: { host: any; projects: any[]; on
       if (!project) {
         project = (await call('registerProject', { name: name.trim(), source_location: { host_id: null, path: src || null, label: 'PC' }, idempotency_key: keys.current.p })).project;
       }
-      await call('bindProjectLocation', { project_id: project.id, host_id: host.id, path: dst || null, mode, label: host.name, expected_project_revision: project.revision, idempotency_key: keys.current.l });
+      await call('bindProjectLocation', { project_id: project.id, host_id: host.id, path: dst || null, mode, label: setup.trim() || host.name, expected_project_revision: project.revision,
+        idempotency_key: keys.current.l, ...(otherSource ? { source_path: src } : {}) });
       onDone();
     } catch (e) { setErr(errText(e)); keys.current = { p: idem(), l: idem() }; } finally { setBusy(false); }
   }
@@ -479,16 +483,17 @@ function NewMapping({ host, projects, onDone }: { host: any; projects: any[]; on
       <legend>New mapping</legend>
       <Err e={err} />
       <L t="Project">
-        <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+        <select value={projectId} onChange={(e) => { setProjectId(e.target.value); setSrc(''); }}>
           <option value="new">➕ New project…</option>
           {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select>
       </L>
       {!existing && <L t="Project name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Quran Coach" /></L>}
       <L t="Source folder on this PC">
-        {existing ? <div className="mono">{existing.locations.find((l: any) => l.id === existing.source_location_id)?.path_input ?? '(unset)'}</div>
-          : <PathField value={src} onChange={setSrc} hostId={null} placeholder="C:\src\my-app" />}
+        <PathField value={existing ? src || primary : src} onChange={setSrc} hostId={null} placeholder="C:\src\my-app" />
+        {otherSource && <div className="warn small">A different copy of this project: it becomes an independent working setup with its own destination folder. The existing source ({primary || 'unset'}) is not changed. If that copy only moved, edit its path on the existing mapping instead.</div>}
       </L>
+      <L t="Setup name (optional)"><input value={setup} onChange={(e) => setSetup(e.target.value)} placeholder={otherSource ? 'e.g. learning-branch experiment' : host.name} /></L>
       <L t={`Destination folder on ${host.name} (optional; can be set later)`}><PathField value={dst} onChange={setDst} hostId={host.id} placeholder="~/dev/my-app" /></L>
       <FindOnHost hostId={host.id} query={existing ? { project_id: existing.id } : { source_path: src || undefined, name: name.trim() || undefined }} onPick={setDst} />
       <div className="row">
@@ -534,10 +539,11 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
     <div className="mapping">
       <div className="row">
         <b>{project.name}</b>
+        {dest.label && dest.label !== host.name && <span className="badge" title="working setup">{dest.label}</span>}
         <span className={`badge id-${dest.identity_state}`} title="identity of the destination folder">{dest.identity_state.replace('_', ' ')}</span>
         <span className="small muted">{dest.last_verified_sync ? `synced & verified ${age(dest.last_verified_sync.verified_at)}` : 'never verified'}{dest.last_sync_attempt && !dest.last_verified_sync ? ` · last attempt ${dest.last_sync_attempt.outcome}` : ''}</span>
         <span className="grow" />
-        <button disabled={!!busy} onClick={() => run('pre', async () => setPre(await call('preflightProject', { project_id: project.id, destination_location_id: dest.id, intent: 'inspect' })))}>{busy === 'pre' ? 'Checking…' : 'Preflight'}</button>
+        <button disabled={!!busy} onClick={() => run('pre', async () => setPre(await call('preflightProject', { project_id: project.id, destination_location_id: dest.id, intent: 'build' })))}>{busy === 'pre' ? 'Checking…' : 'Preflight'}</button>
         <button className="danger" onClick={() => {
           const onlyHost = project.locations.filter((l: any) => l.role !== 'source').length === 1;
           if (!confirm(`Remove the mapping of "${project.name}" to ${host.name}?\n\nMetadata only: no folder on either machine is touched.${onlyHost ? '\nThe project itself is removed too (it has no other hosts).' : ''}`)) return;
@@ -557,6 +563,7 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
       {pre && (
         <div className="preflight">
           <div className="row"><span className={`badge v-${pre.verdict}`}>{pre.verdict.replaceAll('_', ' ')}</span><span className="muted small">{age(pre.evaluated_at)} · source snapshot {pre.source_snapshot}</span><span className="grow" /><button className="link" onClick={() => setPre(null)}>hide</button></div>
+          <div className="row small">{Object.entries(pre.summary.readiness).map(([k, v]) => <span key={k} className="badge" title={k === 'toolchain' ? pre.toolchain?.note ?? '' : ''}>{k.replace('_', ' ')}: {String(v).replaceAll('_', ' ')}</span>)}</div>
           <ul>{pre.facts.map((f: any, i: number) => <li key={i} className={f.blocking ? '' : 'muted'}><b>{f.kind.replaceAll('_', ' ')}</b>: {f.detail}{f.paths?.length ? <div className="mono small">{f.paths.slice(0, 12).join('  ')}{f.paths.length > 12 ? ' …' : ''}</div> : null}</li>)}</ul>
           <div className="small"><b>Plan ({pre.suggested_plan.kind.replaceAll('_', ' ')})</b> <span className="muted">— carried out by your AI agent through SSH, then verified here</span></div>
           <ol className="small">{pre.suggested_plan.steps.map((s: string, i: number) => <li key={i}>{s}</li>)}</ol>

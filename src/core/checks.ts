@@ -214,6 +214,7 @@ export async function approveHostKey(ctx: Ctx, raw: unknown) {
 // ---- capability probes (built-in only) ----
 
 const BIN = /^[A-Za-z0-9._+-]{1,64}$/;
+export const KNOWN_BIN_DIRS = '"$HOME/development/flutter/bin" "$HOME/flutter/bin" "$HOME/fvm/default/bin" /opt/homebrew/bin /usr/local/bin "$HOME/.pub-cache/bin" "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.gem/bin"';
 
 export async function probeCapabilities(ctx: Ctx, raw: unknown) {
   const input = z.object({ host_id: z.uuid(), probe_ids: z.array(z.string().min(2).max(80)).min(1).max(10) }).strict().parse(raw);
@@ -240,7 +241,7 @@ export async function probeCapabilities(ctx: Ctx, raw: unknown) {
       // Non-login SSH PATH often misses Homebrew/Flutter/fvm: try PATH, then a login shell, then well-known dirs.
       cmd = os === 'windows' ? `cmd /c "where ${name} && echo __rc=0 || echo __rc=1"` : `v=path; p=$(command -v ${name} 2>/dev/null)
 [ -z "$p" ] && v=login && p=$(zsh -lc 'command -v ${name}' 2>/dev/null || bash -lc 'command -v ${name}' 2>/dev/null)
-[ -z "$p" ] && v=known_dir && for d in "$HOME/development/flutter/bin" "$HOME/flutter/bin" "$HOME/fvm/default/bin" /opt/homebrew/bin /usr/local/bin "$HOME/.pub-cache/bin" "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.gem/bin"; do [ -x "$d/${name}" ] && p="$d/${name}" && break; done
+[ -z "$p" ] && v=known_dir && for d in ${KNOWN_BIN_DIRS}; do [ -x "$d/${name}" ] && p="$d/${name}" && break; done
 if [ -n "$p" ]; then echo "$p"; echo "__found_via=$v"; "$p" --version 2>&1 | head -n 3; echo "__rc=0"; else echo "__rc=1"; fi`;
     }
     const r = await sshRun(ctx, row, cmd, s.probe_timeout_s);

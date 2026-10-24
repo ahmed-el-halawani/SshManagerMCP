@@ -88,8 +88,11 @@ tool('ssh_projects_find_on_host', 'ALWAYS call this before binding a project to 
   z.object({ host_id: uuid, project_id: uuid.optional(), name: z.string().max(100).optional(), source_path: z.string().max(4096).optional(), search_root: z.string().max(4096).optional(), max_depth: z.number().int().min(1).max(8).optional() }),
   RO_NET, (i) => core.findProjectOnHost(i));
 
-tool('ssh_projects_bind_location', 'Bind a project to a path on a host (adopt an existing checkout by default). path may be omitted = unset. Never creates folders or copies files.',
+tool('ssh_projects_bind_location', 'Bind a project to a path on a host (adopt an existing checkout by default) = one working setup. path may be omitted = unset. Never creates folders or copies files. ' +
+  'To work from ANOTHER local copy of the same project (other branch/worktree), pass its folder as source_path: that creates an independent setup with its own destination folder; do not change the existing source. ' +
+  'Only do that when the user asked for a separate setup; if the existing copy merely moved, use ssh_projects_update_location on the source instead. Destination folders may not overlap another setup (PATH_OVERLAP).',
   z.object({ project_id: uuid, host_id: uuid.nullable(), path: z.string().nullable().optional(), mode: z.enum(['adopt_existing', 'create_if_missing']).optional(), label: z.string().optional(),
+    source_path: z.string().optional(), source_location_id: uuid.optional(),
     policy: ConsistencyPolicy.partial().optional(), expected_project_revision: z.number().int(), idempotency_key: IdemKey }), WRITE, (i) => core.bindProjectLocation(i));
 
 tool('ssh_projects_update_location', 'Edit/clear a location path, label, mode or policy; or confirm_identity after the user accepted a fork/renamed remote. Invalidates old verification; never moves or deletes files.',
@@ -102,8 +105,11 @@ tool('ssh_projects_unbind_location', 'Remove a location binding (metadata only; 
 tool('ssh_projects_inspect', 'Read-only inspection of locations: path state, Git root/branch/HEAD/dirty/conflicts, content manifest digest. No fetch/pull/checkout/mkdir.',
   z.object({ project_id: uuid, location_ids: z.array(uuid).max(10).optional() }), RO_NET, (i) => core.inspectProject(i));
 
-tool('ssh_projects_preflight', 'REQUIRED before build/run/test on a destination: fresh inspection of source+destination, verdict (ready | path_unset | wrong_repository | branch_mismatch | revision_mismatch | destination_dirty | content_mismatch | ...), all facts, and a non-destructive reconciliation plan.',
-  z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string().optional(), intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).optional() }), RO_NET, (i) => core.preflightProject(i));
+tool('ssh_projects_preflight', 'REQUIRED before build/run/test on a destination: one call that inspects the setup\'s source + destination and returns summary (both paths, branch/commit, readiness per concern, files to copy, next_step), ' +
+  'verdict for FILES (ready | path_unset | wrong_repository | branch_mismatch | revision_mismatch | destination_dirty | content_mismatch | ...), ready_for_intent (files AND toolchain), facts, and a non-destructive plan. ' +
+  'destination_dirty is judged against the last verified sync: only files changed on the destination after it are protected. For build/run/test it compares Flutter/Dart on both sides with pubspec constraints (read-only). device/test_tool are not_checked.',
+  z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string().optional(), intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).optional(),
+    detail: z.enum(['summary', 'full']).optional() }), RO_NET, (i) => core.preflightProject(i));
 
 tool('ssh_projects_verify_sync', 'After YOU transferred files, have the manager re-read both sides and verify the destination matches expected_source_snapshot. Your own claim of success is not evidence.',
   z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string(), operation_id: z.string(), expected_generations: z.object({ source: z.number().int(), destination: z.number().int() }), transfer_mode: z.string().optional() }),

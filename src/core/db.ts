@@ -107,6 +107,10 @@ const MIGRATIONS: string[] = [
   UPDATE project_locations SET identity_state='content_verified'
   WHERE identity_state='unverified' AND last_verified_sync_id IS NOT NULL;
   `,
+  // 5: independent working setups: an execution location may pair with its own source folder
+  `
+  ALTER TABLE project_locations ADD COLUMN source_location_id TEXT REFERENCES project_locations(id);
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
