@@ -43,7 +43,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: node_modules
-          key: modules-${{ runner.os }}-node24-${{ hashFiles('package-lock.json') }}
+          key: modules-v2-${{ runner.os }}-node24-${{ hashFiles('package-lock.json') }} # v2: v1 was saved without the Electron binary
 
       - name: Restore Electron downloads
         id: electron
@@ -56,6 +56,14 @@ jobs:
       - name: Install dependencies
         if: steps.modules.outputs.cache-hit != 'true'
         run: npm ci
+
+      # npm 11 on the runner skips install scripts, so Electron's postinstall never fetched electron.exe
+      # (the MCP smoke test then failed with "cannot find the path"). Run its installer explicitly:
+      # a no-op (~0.3 s) when the binary is there, and it uses the restored Electron download cache.
+      - name: Ensure Electron binary
+        run: |
+          node node_modules/electron/install.js
+          if (-not (Test-Path node_modules/electron/dist/electron.exe)) { throw 'electron.exe is still missing' }
 
       - name: Save node_modules
         if: steps.modules.outputs.cache-hit != 'true'
