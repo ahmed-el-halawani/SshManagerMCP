@@ -44,6 +44,12 @@ The MCP server gives you a **registry and verification tools only**. It does not
 4. If the verdict is not `ready`, follow `suggested_plan` and the `facts`. Never `reset --hard`, `clean`, `checkout --force`, `stash` or delete remote files to make things match. Preserve the user's work and ask when the plan says so.
    - `destination_dirty` is judged against the **last verified sync**. Files you synced earlier are not someone else's work, even though they are uncommitted there.
    - Only files that changed on the destination after that sync are protected: `since_verified_sync.remote_only`, or `both`, which is a real conflict.
+     - `destination_dirty`: those changes are uncommitted there. `git status` and `git diff` show them.
+     - `destination_ahead`: those changes are in commits made there, for example an Xcode team setting. The working tree is clean, so compare commits as the plan says.
+   - **When the user chooses to run the destination as it is** (keeping its own commits), re-run preflight with `basis: "destination"`:
+     - `execution.verdict` checks only that checkout.
+     - `execution.commit` is what you will run; report it.
+     - `ready_for_intent` follows `execution.verdict`. Do not transfer files in that case.
 5. Transfer with your terminal (scp/sftp/git bundle). Hold `ssh_projects_acquire_lease` while you transfer.
 6. `ssh_projects_verify_sync` with the `source_snapshot` and `generations` from preflight. Your own report of "copied OK" is not evidence.
    - `partial` means some files arrived, for example after a dropped connection. Retry the copy and verify again.
@@ -51,8 +57,11 @@ The MCP server gives you a **registry and verification tools only**. It does not
 
 ## Code signing on macOS hosts (iPhone / release builds)
 - Over plain SSH, `codesign` fails with `errSecInternalComponent`. macOS unlocks a keychain only for the session that unlocked it, and every SSH connection is a new session.
+- First call `ssh_hosts_check_signing`. It reports `certificate`, `unlock` and `key_access` separately, and only `ready: true` means a device build can sign. A certificate that is found but not usable is exactly the failure we hit before.
 - Look at the `signing` block of `ssh_hosts_get_connection_recipe`. When `signing.mode` is not `off`, run every command that code-signs this way:
-  - Use `signing.argv` with `signing.env`, then add the remote command as ONE final argument. Examples: `flutter build ios --release`, `flutter run --release -d <udid>`, `xcodebuild` for a device.
+  - **On Windows:** put the remote command in the env var named by `signing.command_env` (`SSHRM_REMOTE_COMMAND`), then run `signing.argv`, which is a `.cmd` launcher. `signing.display` shows the PowerShell form.
+  - Never call the app `.exe` directly. It is a GUI program, so PowerShell returns at once with no output and no exit code while the job keeps running.
+  - Examples of commands that need this: `flutter build ios --release`, `flutter run --release -d <udid>`, `xcodebuild` for a device.
   - The runner opens its own SSH session, unlocks the keychain inside it, and runs your command in a login shell. Output and exit code pass through.
   - The secret never reaches you. Never ask the user for a keychain password, and never type one.
 - Runner exit codes: 96, 97 or 98 mean the unlock itself failed and your command did not run. 3 is a manager error, printed as JSON on stderr.

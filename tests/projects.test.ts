@@ -283,6 +283,44 @@ test('after a verified sync, later local edits are not destination work; destina
   assert.equal(readFileSync(join(dst, 'src', 'b.txt'), 'utf8'), 'edited on the mac\n');
 });
 
+test('a commit made on the destination is destination_ahead (not dirty); basis "destination" runs that checkout as it is', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  writeFileSync(join(src, 'a.txt'), 'synced edit\n');
+  const { core, pre, project, loc } = setup(src, dst);
+  assert.equal((await syncOnce(core, project, loc, src, dst, pre)).v.outcome, 'verified');
+  writeFileSync(join(dst, 'src', 'b.txt'), 'team setting changed on the mac\n');
+  git(dst, 'commit', '-qam', 'mac-only commit'); // like the Xcode team commit: working tree clean afterwards
+  const r = await pre() as Pre & { execution: { verdict: string; commit: string } };
+  assert.equal(r.verdict, 'destination_ahead', JSON.stringify(r.facts));
+  assert.ok(!r.facts.some((f) => f.kind === 'destination_dirty'));
+  assert.equal(r.suggested_plan.kind, 'preserve_commits');
+
+  const asIs = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, basis: 'destination' }) as typeof r & { ready_for_intent: boolean };
+  assert.equal(asIs.verdict, 'destination_ahead', 'the sync verdict is unchanged');
+  assert.equal(asIs.execution.verdict, 'ready');
+  assert.equal(asIs.ready_for_intent, true);
+  assert.equal(asIs.execution.commit, git(dst, 'rev-parse', 'HEAD'));
+
+  writeFileSync(join(dst, 'src', 'b.txt'), 'and an uncommitted edit\n');
+  assert.equal((await pre()).verdict, 'destination_dirty');
+});
+
+test('summary output caps path lists per fact; detail "full" keeps them', async () => {
+  const files = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`f${i}.txt`, `v${i}\n`]));
+  const src = tempRepo(files);
+  const dst = cloneTo(src);
+  for (const f of Object.keys(files)) writeFileSync(join(src, f), 'changed\n');
+  const { core, pre, project, loc } = setup(src, dst);
+  const s = (await pre()).facts.find((f) => f.kind === 'content_mismatch') as { paths: string[]; paths_total?: number };
+  assert.equal(s.paths.length, 5);
+  assert.equal(s.paths_total, 12);
+  const full = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, detail: 'full' }) as Pre & { source?: unknown };
+  assert.equal(full.facts.find((f) => f.kind === 'content_mismatch')!.paths!.length, 12);
+  assert.ok(full.source, 'raw inspections only in full');
+  assert.equal((await pre()).suggested_plan.copy!.length, 12, 'the copy list is never shortened');
+});
+
 test('recovery: interrupted transfer is partial, retry verifies; destination edited after preflight; expired lease', async () => {
   const src = tempRepo({ 'a.txt': 'a\n', 'b.txt': 'b\n', 'c.txt': 'c\n' });
   const dst = cloneTo(src);

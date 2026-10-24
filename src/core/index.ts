@@ -33,7 +33,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
   const dataDir = opts.dataDir ?? resolveDataDir();
   for (const d of ['logs', 'manifests']) mkdirSync(join(dataDir, d), { recursive: true });
   const db = openDb(dataDir);
-  if (process.platform === 'win32') writeAskpass(dataDir);
+  if (process.platform === 'win32') { writeAskpass(dataDir); signing.writeRunnerShim(dataDir); }
   const ctx: Ctx = { db, dataDir, source: opts.source };
   const s = opts.source;
   return {
@@ -58,6 +58,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     // code signing over SSH: the mode is the user's choice (GUI only); setup may also be triggered by an agent once the mode is set
     setSigningMode: (i: unknown) => signing.setSigningMode(ctx, i),
     setupBuildKeychain: (i: unknown) => signing.setupBuildKeychain(ctx, i),
+    checkSigning: (i: unknown) => signing.checkSigning(ctx, i),
     hostHistory: (i: { host_id: string; limit?: number }) => ({
       checks: (db.prepare('SELECT * FROM checks WHERE host_id=? ORDER BY started_at DESC LIMIT ?').all(z.uuid().parse(i.host_id), Math.min(i.limit ?? 20, 100)) as Record<string, unknown>[])
         .map((c) => ({ ...c, diagnostics: c.diagnostics_json ? JSON.parse(c.diagnostics_json as string) : null, diagnostics_json: undefined })),

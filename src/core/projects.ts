@@ -683,7 +683,7 @@ export async function inspectProject(ctx: Ctx, raw: unknown) {
 
 type Fact = { kind: string; blocking: boolean; detail: string; paths?: string[] };
 const VERDICT_ORDER = ['path_unset', 'path_missing', 'unsupported_layout', 'wrong_repository', 'conflicts_present', 'source_changed', 'destination_dirty',
-  'branch_mismatch', 'revision_mismatch', 'identity_unverified', 'content_mismatch', 'needs_recheck'];
+  'destination_ahead', 'branch_mismatch', 'revision_mismatch', 'identity_unverified', 'content_mismatch', 'needs_recheck'];
 
 function overlapFacts(db: DB, l: LocationRow, canonical: string | undefined, home?: string): Fact[] {
   if (!canonical) return [];
@@ -781,7 +781,15 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
     diff.since_verified_sync = since;
     if (differing.length) add('changes_since_verified_sync', `since the last verified sync: ${since.local_only.length} changed on source only, ${since.remote_only.length} on destination only, ${since.both.length} on both`, undefined, false);
     const atRisk = [...since.both, ...since.remote_only];
-    if (atRisk.length) add('destination_dirty', `${atRisk.length} file(s) changed on the destination after the last verified sync (${since.both.length} also changed on source = conflict); copying would overwrite that work`, atRisk);
+    // Uncommitted work vs commits made on the destination: both must not be overwritten, but they are fixed differently.
+    // A truncated dirty list cannot prove a path clean: treat it as uncommitted (the safe side).
+    const dirtyList = new Set(dg?.dirty_paths ?? []);
+    const listComplete = !dg?.is_repo || dirtyList.size >= dg.staged + dg.unstaged + dg.untracked + dg.conflicts;
+    const uncommitted = atRisk.filter((p) => !dg?.is_repo || dirtyList.has(p) || !listComplete);
+    const committed = atRisk.filter((p) => !uncommitted.includes(p));
+    const conflictNote = since.both.length ? ` (${since.both.length} also changed on source = conflict)` : '';
+    if (uncommitted.length) add('destination_dirty', `${uncommitted.length} file(s) changed on the destination after the last verified sync and are not committed there${conflictNote}; copying would overwrite that work`, uncommitted);
+    if (committed.length) add('destination_ahead', `${committed.length} file(s) changed in commits made on the destination after the last verified sync (destination ${dg?.head?.slice(0, 12)} vs source ${sg?.head?.slice(0, 12)})${conflictNote}; the working tree there is clean, so git status shows nothing`, committed);
   } else {
     const destDirtyAtRisk = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
     if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten (no verified sync yet to tell who changed it)', destDirtyAtRisk);
@@ -809,7 +817,14 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
       : { kind: 'fix_path', steps: ['The adopted path does not exist. Ask the user for the correct existing path, or switch mode to create_if_missing explicitly.'] };
     case 'wrong_repository': return { kind: 'rebind', steps: ['Do not modify this folder. Ask the user for the correct checkout path, or confirm identity explicitly if this really is a fork (update_project_location confirm_identity).'] };
     case 'conflicts_present': return { kind: 'manual', steps: ['Resolve merge conflicts with the user. Never reset, clean, or checkout --force automatically.'] };
-    case 'destination_dirty': return { kind: 'preserve_work', steps: ['Show the user the destination diff (git -C <path> status / diff).', 'Options: commit/push it from there, copy it aside, or choose another worktree. Never stash/reset/clean silently.'] };
+    case 'destination_dirty': return { kind: 'preserve_work', steps: [`Show the user the uncommitted destination changes: git -C ${posixQuote(root)} status / diff.`, 'Options: commit/push it from there, copy it aside, or choose another worktree. Never stash/reset/clean silently.'] };
+    case 'destination_ahead': {
+      const s = src.git?.head?.slice(0, 12) ?? '<source-head>', d = dst.git?.head?.slice(0, 12) ?? '<destination-head>';
+      return { kind: 'preserve_commits', steps: [
+        `The destination has its own commits. Compare them on the destination: git -C ${posixQuote(root)} log --oneline ${s}..${d}  and  git -C ${posixQuote(root)} diff ${s} ${d} --stat (if ${s} is unknown there, the source has commits the destination lacks too).`,
+        `To keep working from the destination as it is, re-run preflight with basis:"destination": it checks that checkout and records the commit you run.`,
+        `To sync instead, bring those commits to the source first: on the destination 'git bundle create ahead.bundle ${s}..HEAD', copy it to the source, 'git fetch ahead.bundle HEAD' and merge there. Never overwrite them.`] };
+    }
     case 'branch_mismatch': return { kind: 'choose_checkout', steps: ['Prefer another existing checkout/worktree on the right branch, or (if destination is clean and the user agrees) git switch <branch> there. Do not force a branch to match names.'] };
     case 'revision_mismatch': steps.push(
       `Move commits without a cloud remote: on source 'git bundle create sync.bundle ${dst.git?.head ? `${dst.git.head.slice(0, 12)}..` : ''}${src.git?.branch ?? 'HEAD'}', scp it, then on destination 'git fetch sync.bundle ${src.git?.branch ?? 'HEAD'}' and 'git merge --ff-only FETCH_HEAD'.`,
@@ -845,10 +860,13 @@ function leaseInfo(db: DB, locationId: string) {
 }
 
 const NOT_CONNECTION = ['MACOS_PRIVACY_BLOCKED', 'PROBE_UNSUPPORTED'];
+/** With basis "destination", only these stop running the destination checkout itself. */
+const RUN_AS_IS_BLOCKERS = ['path_unset', 'path_missing', 'unsupported_layout', 'wrong_repository', 'conflicts_present', 'needs_recheck'];
 
 export async function preflightProject(ctx: Ctx, raw: unknown) {
   const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid(), expected_source_snapshot: z.string().optional(),
-    intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).default('build'), detail: z.enum(['summary', 'full']).default('summary') }).strict().parse(raw);
+    intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).default('build'), detail: z.enum(['summary', 'full']).default('summary'),
+    basis: z.enum(['source', 'destination']).default('source') }).strict().parse(raw);
   const { project, src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
   const s = await inspectLocation(ctx, project, src);
   const d = await inspectLocation(ctx, getProjectRow(ctx.db, project.id), dest);
@@ -877,18 +895,34 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
   const side = (l: LocationRow, r: typeof s) => ({ location_id: l.id, label: l.label, host_id: l.host_id, path: r.inspection.canonical_path ?? l.path_input,
     branch: r.inspection.git?.branch ?? null, head: r.inspection.git?.head?.slice(0, 12) ?? null,
     uncommitted: r.inspection.git?.is_repo ? r.inspection.git.staged + r.inspection.git.unstaged + r.inspection.git.untracked : null });
+
+  // basis "destination": the user chose to run the destination checkout as it is (e.g. it has its own commits).
+  // Only problems with that checkout itself block; differences from the source are reported, not fixed.
+  const blockingKinds = facts.filter((f) => f.blocking).map((f) => f.kind);
+  const runVerdict = input.basis === 'source' ? verdict : (RUN_AS_IS_BLOCKERS.find((v) => blockingKinds.includes(v)) ?? 'ready');
+  const readyForIntent = runVerdict === 'ready' && toolsOk;
+  if (input.basis === 'destination') readiness.files = runVerdict === 'ready' ? `run_as_is (sync verdict: ${verdict})` : runVerdict;
+  const execution = { basis: input.basis, verdict: runVerdict, commit: (input.basis === 'source' ? s : d).inspection.git?.head ?? null,
+    branch: (input.basis === 'source' ? s : d).inspection.git?.branch ?? null,
+    ...(input.basis === 'destination' ? { note: 'Runs the destination as it is. Do not transfer files; record this commit as what was built.' } : {}) };
+  const next = input.basis === 'destination' && runVerdict === 'ready'
+    ? `Run from ${d.inspection.canonical_path} at ${execution.commit?.slice(0, 12) ?? 'its current state'} without transferring files (sync verdict is ${verdict}).`
+    : runVerdict === 'ready' && !toolsOk ? `Toolchain ${toolchain.state}: ${toolchain.facts[0]?.detail ?? toolchain.state}` : plan.steps[0];
+  const t = now();
+  // summary: counts plus a few paths per fact; detail:"full" keeps every list and the raw inspections
+  const compact = (f: Fact) => (input.detail === 'full' || !f.paths || f.paths.length <= 5 ? f : { ...f, paths: f.paths.slice(0, 5), paths_total: f.paths.length });
   return {
-    verdict, ready_for_intent: verdict === 'ready' && toolsOk, intent: input.intent,
-    summary: { setup: dest.label || null, source: side(src, s), destination: side(dest, d), readiness, files_to_copy: (plan as { copy_count?: number }).copy_count ?? 0,
-      since_verified_sync: diff.since_verified_sync && Object.fromEntries(Object.entries(diff.since_verified_sync).map(([k, v]) => [k, v.length])), lease,
-      next_step: verdict === 'ready' && !toolsOk ? `Toolchain ${toolchain.state}: ${toolchain.facts[0]?.detail ?? toolchain.state}` : plan.steps[0] },
-    facts, source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
+    verdict, ready_for_intent: readyForIntent, intent: input.intent, execution,
+    summary: { setup: dest.label || null, source: side(src, s), destination: side(dest, d), readiness: { ...readiness, as_of: t }, files_to_copy: (plan as { copy_count?: number }).copy_count ?? 0,
+      since_verified_sync: diff.since_verified_sync && Object.fromEntries(Object.entries(diff.since_verified_sync).map(([k, v]) => [k, v.length])), lease, next_step: next },
+    facts: facts.map(compact), source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
     generations: { source: src.location_generation, destination: dest.location_generation },
-    evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: now(),
-    ready_until: verdict === 'ready' ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
-    suggested_plan: plan, toolchain,
+    evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t,
+    ready_until: readyForIntent ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
+    suggested_plan: plan, toolchain, // never shortened: its copy list is what the agent transfers
     ...(input.detail === 'full' ? { source: summarize(s), destination: summarize(d) } : {}),
-    note: 'verdict covers files only; check readiness for toolchain/device. Readiness is evidence at a point in time, not a lock. device/test_tool are not_checked: probe them yourself. Pass detail:"full" for raw inspections.',
+    note: 'verdict covers syncing files from the source; execution.verdict covers the checkout you will run; ready_for_intent adds the toolchain. ' +
+      'readiness.as_of is when this evidence was read (newer than a host check shown elsewhere). device/test_tool are not_checked. detail:"full" returns every path and the raw inspections.',
   };
 }
 

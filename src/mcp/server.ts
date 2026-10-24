@@ -96,6 +96,9 @@ tool('ssh_hosts_setup_build_keychain', 'macOS hosts whose user chose the "build 
   'Normally not needed: the signing runner does it on first use. Call it after the user renewed their certificate or when the runner reports the build keychain is broken. You cannot change the signing mode; only the user can, in the GUI.',
   z.object({ host_id: uuid }), { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.setupBuildKeychain(i));
 
+tool('ssh_hosts_check_signing', 'macOS hosts: is code signing over SSH ready? Checks three stages separately: a code-signing certificate is found, the keychain unlocks in an SSH session (per the host signing mode), and a throwaway file can actually be signed. Run before a device/release build; a found certificate alone is not enough.',
+  z.object({ host_id: uuid }), RO_NET, (i) => core.checkSigning(i));
+
 tool('ssh_hosts_remove', 'Remove the local registry record only. Does not touch the remote machine, keys or ssh config.',
   z.object({ host_id: uuid, expected_revision: z.number().int() }), { readOnlyHint: false, destructiveHint: true, openWorldHint: false }, (i) => core.removeHost(i));
 
@@ -131,9 +134,11 @@ tool('ssh_projects_inspect', 'Read-only inspection of locations: path state, Git
 
 tool('ssh_projects_preflight', 'REQUIRED before build/run/test on a destination: one call that inspects the setup\'s source + destination and returns summary (both paths, branch/commit, readiness per concern, files to copy, next_step), ' +
   'verdict for FILES (ready | path_unset | wrong_repository | branch_mismatch | revision_mismatch | destination_dirty | content_mismatch | ...), ready_for_intent (files AND toolchain), facts, and a non-destructive plan. ' +
-  'destination_dirty is judged against the last verified sync: only files changed on the destination after it are protected. For build/run/test it compares Flutter/Dart on both sides with pubspec constraints (read-only). device/test_tool are not_checked.',
+  'Changes made on the destination after the last verified sync are protected: destination_dirty = uncommitted there, destination_ahead = committed there (compare commits, not git status). ' +
+  'To run the destination checkout as it is (the user chose to keep its own commits), pass basis:"destination": execution.verdict then covers only that checkout and execution.commit records what you run; do not transfer files. ' +
+  'For build/run/test it compares Flutter/Dart on both sides with pubspec constraints (read-only). device/test_tool are not_checked. Summary output is compact; detail:"full" for every path.',
   z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string().optional(), intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).optional(),
-    detail: z.enum(['summary', 'full']).optional() }), RO_NET, (i) => core.preflightProject(i));
+    detail: z.enum(['summary', 'full']).optional(), basis: z.enum(['source', 'destination']).optional() }), RO_NET, (i) => core.preflightProject(i));
 
 tool('ssh_projects_verify_sync', 'After YOU transferred files, have the manager re-read both sides and verify the destination matches expected_source_snapshot. Your own claim of success is not evidence.',
   z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string(), operation_id: z.string(), expected_generations: z.object({ source: z.number().int(), destination: z.number().int() }), transfer_mode: z.string().optional() }),

@@ -5,16 +5,16 @@
  */
 import { spawn } from 'node:child_process';
 import { createCore, errorPayload } from '../core/index.ts';
-import { prepareSignedRun, setupBuildKeychain, WRAPPER_EXIT } from '../core/signing.ts';
+import { COMMAND_ENV, prepareSignedRun, setupBuildKeychain, WRAPPER_EXIT } from '../core/signing.ts';
 import { childEnv } from '../core/ssh.ts';
 
 const argv = process.argv.slice(2);
 const sep = argv.indexOf('--');
 const opt = (k: string) => argv.slice(0, sep < 0 ? undefined : sep).find((a) => a.startsWith(`--${k}=`))?.slice(k.length + 3);
-const command = sep < 0 ? undefined : argv.slice(sep + 1).join(' ');
+const command = (sep < 0 ? '' : argv.slice(sep + 1).join(' ')) || process.env[COMMAND_ENV];
 const hostId = opt('host');
 if (!hostId || !command) {
-  process.stderr.write('usage: run.js --data-dir=<dir> --host=<host_id> -- "<remote command>"\n');
+  process.stderr.write(`usage: run.js --data-dir=<dir> --host=<host_id> [-- "<remote command>"]   (or the command in env ${COMMAND_ENV})\n`);
   process.exit(2);
 }
 
