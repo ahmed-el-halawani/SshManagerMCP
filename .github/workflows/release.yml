@@ -1,0 +1,97 @@
+# Every push to master/main: test, build the Windows installer, and publish it as a GitHub release
+# with an incrementing version (major.minor from package.json, patch = workflow run number).
+name: Build and release
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create tags and releases
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never cancel a half-published release
+
+env:
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false' # no code-signing certificate in CI
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm # ~/.npm, keyed on package-lock.json
+
+      # node_modules (including the Electron binary its postinstall puts there): a hit skips `npm ci` entirely.
+      - name: Cache node_modules
+        id: modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: modules-${{ runner.os }}-node24-${{ hashFiles('package-lock.json') }}
+
+      # Electron / electron-builder downloads (Electron zip, NSIS, icon tools): same versions = no re-download.
+      # Their default folders, outside the repo on purpose: inside it, the extracted helper scripts would
+      # inherit this package's "type": "module" and crash (seen in a local dry run).
+      - name: Cache Electron downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - name: Install dependencies
+        if: steps.modules.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Set version
+        id: version
+        run: |
+          $parts = (node -p "require('./package.json').version").Split('.')
+          $version = "$($parts[0]).$($parts[1]).${{ github.run_number }}"
+          npm version $version --no-git-tag-version --allow-same-version | Out-Null
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "Building version $version"
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build installer
+        run: |
+          npm run build
+          npx electron-builder --win --publish never
+          Get-ChildItem dist-installer -Filter *.exe | ForEach-Object { "$($_.Name)  $([math]::Round($_.Length / 1MB, 1)) MB" }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSH-Resource-Manager-${{ steps.version.outputs.version }}
+          path: dist-installer/*Setup*.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: SSH Resource Manager ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Windows installer built from ${{ github.sha }}.
+
+            ${{ github.event.head_commit.message }}
+          files: dist-installer/*Setup*.exe
+          fail_on_unmatched_files: true
