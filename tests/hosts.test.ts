@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -206,4 +206,41 @@ test('schema: newer DB refused; v1-only DB upgrades without losing hosts', () =>
   up.close();
   assert.throws(() => openDb(dir), (e: AppError) => e.code === 'SCHEMA_TOO_NEW');
   new DatabaseSync(join(dir, 'registry.db')).close();
+});
+
+test('switch to key auth: installs the key with the stored password, keeps trust and password, only switches after a key login works', async () => {
+  const core = makeCore('gui');
+  const home = mkdtempSync(join(tmpdir(), 'sshrm-home-'));
+  mkdirSync(join(home, '.ssh'));
+  writeFileSync(join(home, '.ssh', 'authorized_keys'), 'ssh-rsa AAAA existing'); // no trailing newline
+  const env = { HOME: process.env.HOME, FAKE_SSH_MODE: process.env.FAKE_SSH_MODE };
+  process.env.HOME = home; // the fake remote is Git-Bash sh, which takes ~ from HOME
+  try {
+    let h = core.registerHost({ profile: { mode: 'direct', hostname: 'h.lan', port: 22, username: 'dev', auth: 'password' }, metadata: { name: 'pw', declared_os: 'linux' }, idempotency_key: key() }).host;
+    core.setHostPassword({ host_id: h.id, password: 'pw' });
+    const gen = core.getHost({ host_id: h.id }).identity_generation;
+
+    process.env.FAKE_SSH_MODE = 'auth';
+    await assert.rejects(core.switchToKeyAuth({ host_id: h.id }), (e: AppError) => e.code === 'AUTH_REQUIRED');
+    assert.equal(core.getHost({ host_id: h.id }).auth, 'password', 'a failed install changes nothing');
+
+    process.env.FAKE_SSH_MODE = 'sh';
+    const r = await core.switchToKeyAuth({ host_id: h.id });
+    const got = core.getHost({ host_id: h.id });
+    assert.equal(got.auth, 'key');
+    assert.equal(got.profile.mode === 'direct' && got.profile.identity_file, r.identity_file);
+    assert.equal(got.identity_generation, gen, 'auth is not identity: trust and locations stay valid');
+    assert.equal(got.password_stored, true);
+    const lines = () => readFileSync(join(home, '.ssh', 'authorized_keys'), 'utf8').split('\n').filter(Boolean);
+    assert.equal(lines()[0], 'ssh-rsa AAAA existing', 'missing trailing newline was fixed, not glued');
+    assert.match(lines()[1], /^ssh-ed25519 \S+ sshrm:/);
+
+    await assert.rejects(core.switchToKeyAuth({ host_id: h.id }), (e: AppError) => e.code === 'VALIDATION_ERROR');
+    // switching back and again reuses the key and does not duplicate the line
+    h = core.updateHost({ host_id: h.id, expected_revision: got.revision, idempotency_key: key(), patch: { profile: { ...got.profile, auth: 'password' } } }).host;
+    await core.switchToKeyAuth({ host_id: h.id });
+    assert.equal(lines().length, 2);
+  } finally {
+    for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
 });

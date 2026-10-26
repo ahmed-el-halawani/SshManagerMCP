@@ -67,7 +67,12 @@ Error codes: `VALIDATION_ERROR NOT_FOUND REVISION_CONFLICT IDEMPOTENCY_CONFLICT 
 - **Storage:** the password is set only through the GUI (`setHostPassword`; no MCP tool exists) and stored as a DPAPI (CurrentUser) blob in `host_secrets`.
 - **ssh options for password hosts:** `BatchMode=no`, `PreferredAuthentications=password,keyboard-interactive`, `PubkeyAuthentication=no`, `NumberOfPasswordPrompts=1`, `StrictHostKeyChecking=yes`. The env sets `SSH_ASKPASS=<data-dir>\askpass.cmd`, `SSH_ASKPASS_REQUIRE=force` and `SSHRM_HOST_ID`. No TTY is involved, so nothing can hang on a prompt.
 - **Recipes:** return the same `env` and never the password.
-- **Lifecycle:** changing a profile identity field deletes the secret.
+- **Lifecycle:** changing a profile identity field deletes the secret. `auth`, `identity_file` and `identities_only` are **not** identity fields: they say how to log in to the same account, so changing them keeps trust, secrets and bound locations.
+- **Switch to SSH key (GUI only, `switchToKeyAuth`; no MCP tool):** direct macOS/Linux hosts with a stored password.
+  - Generates `<data-dir>\keys\<host_id>_ed25519` (no passphrase, comment `sshrm:<host_id>`), restricted to the current Windows user with `icacls`. An existing key is reused.
+  - Logs in with the password and sends the public key over stdin. The remote side creates `~/.ssh` (700) and `authorized_keys` (600) and appends the key only if it is not already there.
+  - Then tests a key-only login (`BatchMode=yes`, `IdentitiesOnly=yes`). Only if that works does the profile switch to `auth: key` with that `identity_file`. On any failure nothing changes.
+  - The password stays stored (login-keychain signing uses it). The server's password login is not disabled, and removing the host does not delete the key file or the `authorized_keys` line.
 - **Host-key candidates:** captured with `ssh` itself into a throwaway known_hosts file with all auth disabled, not with `ssh-keyscan`. Windows' keyscan 9.5 cannot negotiate key exchange with OpenSSH 10 servers. This also works through ProxyJump.
 
 ## Code signing over SSH (migration 6)

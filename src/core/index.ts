@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { approveHostKey, checkHost, connectionRecipe, listRemoteDir, probeCapabilities, type Ctx } from './checks.ts';
 import { openDb, now, tx } from './db.ts';
 import { AppError } from './errors.ts';
+import { switchToKeyAuth } from './keyauth.ts';
 import { getHost, listHosts, registerHost, removeHost, updateHost, profileOf, type HostRow } from './hosts.ts';
 import { parseConnectionInput, type ShellKind } from './parse.ts';
 import { executionEnvironment, resolveDataDir } from './paths.ts';
@@ -55,6 +56,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     // GUI-only: the MCP server deliberately exposes no way to send or read a password.
     setHostPassword: (i: { host_id: string; password: string }) => setHostPassword(db, z.uuid().parse(i.host_id), z.string().parse(i.password)),
     clearHostPassword: (i: { host_id: string }) => clearHostPassword(db, z.uuid().parse(i.host_id)),
+    switchToKeyAuth: (i: unknown) => switchToKeyAuth(ctx, i),
     // code signing over SSH: the mode is the user's choice (GUI only); setup may also be triggered by an agent once the mode is set
     setSigningMode: (i: unknown) => signing.setSigningMode(ctx, i),
     setupBuildKeychain: (i: unknown) => signing.setupBuildKeychain(ctx, i),

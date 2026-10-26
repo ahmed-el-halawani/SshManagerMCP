@@ -44,9 +44,12 @@ export function getHostRow(db: DB, id: string): HostRow {
 
 export const profileOf = (row: HostRow): Profile => JSON.parse(row.connection_profile_json);
 
-/** Fields that define *which* account/endpoint we talk to. Changing any invalidates trust/check state. */
+/**
+ * Fields that define *which* account/endpoint we talk to. Changing any invalidates trust/check state.
+ * How we authenticate to that same account (auth, key file) is not identity: switching password -> key keeps trust and secrets.
+ */
 const identityKey = (p: Profile) => {
-  const { remote_shell_hint: _ignored, ...rest } = p as Profile & { remote_shell_hint?: string };
+  const { remote_shell_hint: _h, auth: _a, identity_file: _i, identities_only: _o, ...rest } = p as Profile & { remote_shell_hint?: string; identity_file?: string; identities_only?: boolean };
   return JSON.stringify(rest);
 };
 
