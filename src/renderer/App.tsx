@@ -358,7 +358,8 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
           <p>OS: declared <b>{h.declared_os}</b>, observed <b>{h.observed_os ?? '—'}</b> {h.observed_os_detail && <span className="muted">({h.observed_os_detail})</span>} {h.os_mismatch && <span className="badge warn">mismatch</span>}</p>
           <p>Authentication: <b>{h.auth === 'password' ? 'username + password' : 'SSH key / agent'}</b>{h.auth === 'password' && (h.password_stored ? ' · password stored (encrypted)' : <span className="warn"> · no password stored — Edit to set it</span>)}
             {h.auth === 'password' && h.password_stored && h.profile.mode === 'direct' && <> <button disabled={busy} title="Generates an SSH key on this PC, installs it on the host using the stored password, tests a key-only login, then switches. The password stays stored."
-              onClick={() => act(async () => { const r = await call('switchToKeyAuth', { host_id: id }); setMsg(r.note); })}>Switch to SSH key</button></>}</p>
+              onClick={() => act(async () => { const r = await call('switchToKeyAuth', { host_id: id }); setMsg(r.note); })}>Switch to SSH key</button></>}
+            {h.ssh_alias && <> · from any terminal: <span className="mono">ssh {h.ssh_alias}</span></>}</p>
           <p>Trusted keys: {h.trust.length ? h.trust.map((t: any) => `${t.algorithm} ${t.fingerprint} (${age(t.approved_at)})`).join('; ') : h.profile.mode === 'ssh_alias' ? 'user-managed known_hosts' : 'none'}</p>
           <h3>Description</h3><p className="pre">{h.description || <span className="muted">—</span>}</p>
           <h3>Instructions</h3><p className="pre">{h.instructions || <span className="muted">—</span>}</p>

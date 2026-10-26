@@ -88,7 +88,7 @@ tool('ssh_hosts_check', 'Run a bounded, read-only SSH connectivity + OS check (B
 tool('ssh_hosts_probe_capabilities', 'Run built-in read-only probes: "macos.xcode" or "binary:<name>" (e.g. binary:git). Declared capability is not proof; this is.',
   z.object({ host_id: uuid, probe_ids: z.array(z.string()).min(1).max(10) }), RO_NET, (i) => core.probeCapabilities(i));
 
-tool('ssh_hosts_get_connection_recipe', 'Get the exact OpenSSH argv for YOUR terminal (shell or file_transfer). caller_environment must match where you run commands (windows-native = PowerShell/cmd on Windows). Nothing is executed. ' +
+tool('ssh_hosts_get_connection_recipe', 'Get the exact OpenSSH argv for YOUR terminal (shell or file_transfer). caller_environment must match where you run commands (windows-native = PowerShell/cmd on Windows). Nothing is executed. The user may change the host in the app at any time: fetch a fresh recipe per task and after any auth/host-key error. ' +
   'For macOS hosts the shell recipe has a "signing" block: when its mode is not off, run anything that code-signs (iOS device/release builds) through signing.argv so the keychain is unlocked in that SSH session; plain ssh fails with errSecInternalComponent.',
   z.object({ host_id: uuid, caller_environment: z.enum(['windows-native', 'posix-native', 'wsl']), purpose: z.enum(['shell', 'file_transfer']).optional() }), RO, (i) => core.connectionRecipe(i));
 

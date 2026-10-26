@@ -214,8 +214,10 @@ test('switch to key auth: installs the key with the stored password, keeps trust
   const home = mkdtempSync(join(tmpdir(), 'sshrm-home-'));
   mkdirSync(join(home, '.ssh'));
   writeFileSync(join(home, '.ssh', 'authorized_keys'), 'ssh-rsa AAAA existing'); // no trailing newline
-  const env = { HOME: process.env.HOME, FAKE_SSH_MODE: process.env.FAKE_SSH_MODE };
+  const env = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, FAKE_SSH_MODE: process.env.FAKE_SSH_MODE };
   process.env.HOME = home; // the fake remote is Git-Bash sh, which takes ~ from HOME
+  process.env.USERPROFILE = home; // os.homedir() on Windows: the local ~/.ssh/config the switch edits
+  writeFileSync(join(home, '.ssh', 'config'), 'Host pw\n  User mine\n'); // the user already has a Host named like ours
   try {
     let h = core.registerHost({ profile: { mode: 'direct', hostname: 'h.lan', port: 22, username: 'dev', auth: 'password' }, metadata: { name: 'pw', declared_os: 'linux' }, idempotency_key: key() }).host;
     core.setHostPassword({ host_id: h.id, password: 'pw' });
@@ -241,6 +243,18 @@ test('switch to key auth: installs the key with the stored password, keeps trust
     h = core.updateHost({ host_id: h.id, expected_revision: got.revision, idempotency_key: key(), patch: { profile: { ...got.profile, auth: 'password' } } }).host;
     await core.switchToKeyAuth({ host_id: h.id });
     assert.equal(lines().length, 2);
+
+    // ~/.ssh/config: one Include line on top, the user's own content kept, their Host name not shadowed
+    const userCfg = readFileSync(join(home, '.ssh', 'config'), 'utf8');
+    assert.equal(userCfg.split('Include ').length, 2, 'Include added once');
+    assert.ok(userCfg.indexOf('Include ') < userCfg.indexOf('Host pw') && userCfg.endsWith('Host pw\n  User mine\n'));
+    const ours = readFileSync(join(core.dataDir, 'ssh_config'), 'utf8');
+    assert.match(ours, /Host sshrm-pw\n  HostName h\.lan\n  Port 22\n  User dev\n  IdentityFile "[^"]+_ed25519"\n  IdentitiesOnly yes\n/);
+    assert.equal(core.getHost({ host_id: h.id }).ssh_alias, 'sshrm-pw');
+    // the file follows the registry: a password host is not in it
+    const g = core.getHost({ host_id: h.id });
+    core.updateHost({ host_id: h.id, expected_revision: g.revision, idempotency_key: key(), patch: { profile: { ...g.profile, auth: 'password' } } });
+    assert.doesNotMatch(readFileSync(join(core.dataDir, 'ssh_config'), 'utf8'), /Host sshrm-pw/);
   } finally {
     for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
   }

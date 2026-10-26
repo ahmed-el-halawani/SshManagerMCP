@@ -7,7 +7,6 @@
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { sshRun, type Ctx } from './checks.ts';
@@ -15,6 +14,7 @@ import { AppError } from './errors.ts';
 import { getHostRow, profileOf, updateHost } from './hosts.ts';
 import { hasPassword } from './secrets.ts';
 import { getSettings } from './settings.ts';
+import { ensureInclude, restrictToOwner, sshAlias, writeSshConfig } from './sshconfig.ts';
 import { run, sanitize, splitCommand, sshArgs } from './ssh.ts';
 
 // Exit codes: 97 no key on stdin, 10-12 a step failed. A file without a trailing newline gets one first,
@@ -34,12 +34,8 @@ async function ensureKey(ctx: Ctx, hostId: string): Promise<{ path: string; pub:
     rmSync(path, { force: true }); rmSync(`${path}.pub`, { force: true });
     const r = await run(splitCommand(getSettings(ctx.db).ssh_keygen_path), ['-q', '-t', 'ed25519', '-N', '', '-C', `sshrm:${hostId}`, '-f', path], { timeoutMs: 20_000 });
     if (r.exit_code !== 0) throw new AppError('INTERNAL_ERROR', `ssh-keygen failed: ${sanitize(r.stderr || r.spawn_error || '').slice(0, 300)}`);
-    // Windows OpenSSH refuses a private key that anyone else can read.
-    if (process.platform === 'win32') {
-      const me = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${userInfo().username}` : userInfo().username;
-      const a = await run(['icacls'], [path, '/inheritance:r', '/grant:r', `${me}:F`], { timeoutMs: 10_000 });
-      if (a.exit_code !== 0) throw new AppError('INTERNAL_ERROR', `could not restrict the key file permissions: ${sanitize(a.stdout + a.stderr).slice(0, 300)}`);
-    }
+    const acl = restrictToOwner(path); // Windows OpenSSH refuses a private key that anyone else can read
+    if (acl) throw new AppError('INTERNAL_ERROR', `could not restrict the key file permissions: ${sanitize(acl).slice(0, 300)}`);
   }
   const pub = readFileSync(`${path}.pub`, 'utf8').trim();
   if (!/^ssh-ed25519 [A-Za-z0-9+/=]+ sshrm:\S+$/.test(pub)) throw new AppError('INTERNAL_ERROR', 'generated public key has an unexpected format');
@@ -76,5 +72,9 @@ export async function switchToKeyAuth(ctx: Ctx, raw: unknown) {
     });
   }
   const r = updateHost(ctx.db, ctx.source, { host_id: row.id, expected_revision: row.revision, idempotency_key: randomUUID(), patch: { profile: keyProfile } });
-  return { host: r.host, identity_file: key.path, note: 'Key auth is on. The password stays stored (macOS login-keychain signing uses it); forget it in Edit if you do not need it.' };
+  writeSshConfig(ctx.db, ctx.dataDir);
+  ensureInclude(ctx.dataDir);
+  const alias = sshAlias(ctx.db, ctx.dataDir, row.id);
+  return { host: r.host, identity_file: key.path, ssh_alias: alias,
+    note: `Key auth is on${alias ? `; from any terminal: ssh ${alias}` : ''}. The password stays stored (macOS login-keychain signing uses it); forget it in Edit if you do not need it.` };
 }

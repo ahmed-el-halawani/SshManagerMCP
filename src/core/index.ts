@@ -5,6 +5,7 @@ import { approveHostKey, checkHost, connectionRecipe, listRemoteDir, probeCapabi
 import { openDb, now, tx } from './db.ts';
 import { AppError } from './errors.ts';
 import { switchToKeyAuth } from './keyauth.ts';
+import { sshAlias, writeSshConfig } from './sshconfig.ts';
 import { getHost, listHosts, registerHost, removeHost, updateHost, profileOf, type HostRow } from './hosts.ts';
 import { parseConnectionInput, type ShellKind } from './parse.ts';
 import { executionEnvironment, resolveDataDir } from './paths.ts';
@@ -37,17 +38,20 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
   if (process.platform === 'win32') { writeAskpass(dataDir); signing.writeRunnerShim(dataDir); }
   const ctx: Ctx = { db, dataDir, source: opts.source };
   const s = opts.source;
+  /** Host changes also refresh <data-dir>\ssh_config, so `ssh <alias>` always matches the registry. */
+  const syncConfig = <T>(r: T) => { writeSshConfig(db, dataDir); return r; };
+  syncConfig(null);
   return {
     dataDir, db, ctx,
     close: () => db.close(),
     // hosts
     parseConnectionInput: (i: { text: string; source_shell: ShellKind }) =>
       parseConnectionInput(z.string().max(2000).parse(i.text), z.enum(['posix', 'powershell', 'cmd']).parse(i.source_shell)),
-    registerHost: (i: unknown) => registerHost(db, s, i),
-    updateHost: (i: unknown) => updateHost(db, s, i),
+    registerHost: (i: unknown) => syncConfig(registerHost(db, s, i)),
+    updateHost: (i: unknown) => syncConfig(updateHost(db, s, i)),
     listHosts: (i: Parameters<typeof listHosts>[1] = {}) => listHosts(db, i),
-    getHost: (i: { host_id: string }) => getHost(db, z.uuid().parse(i.host_id)),
-    removeHost: (i: unknown) => removeHost(db, s, i),
+    getHost: (i: { host_id: string }) => { const id = z.uuid().parse(i.host_id); return { ...getHost(db, id), ssh_alias: sshAlias(db, dataDir, id) }; },
+    removeHost: (i: unknown) => syncConfig(removeHost(db, s, i)),
     checkHost: (i: unknown) => checkHost(ctx, i),
     probeCapabilities: (i: unknown) => probeCapabilities(ctx, i),
     approveHostKey: (i: unknown) => approveHostKey(ctx, i),
@@ -85,7 +89,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     environment: () => ({ execution_environment: executionEnvironment(), data_dir: dataDir, known_hosts: knownHostsPath(dataDir), platform: process.platform }),
     exportData: () => exportData(ctx),
     previewImport: (doc: unknown) => previewImport(ctx, doc),
-    applyImport: (doc: unknown, idempotencyKey: string) => applyImport(ctx, doc, idempotencyKey),
+    applyImport: (doc: unknown, idempotencyKey: string) => syncConfig(applyImport(ctx, doc, idempotencyKey)),
     backup: (dest: string) => { db.exec(`VACUUM INTO '${dest.replaceAll("'", "''")}'`); return { backup: dest }; },
   };
 }
