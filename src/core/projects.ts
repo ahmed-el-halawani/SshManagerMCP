@@ -163,7 +163,7 @@ export function bindProjectLocation(ctx: Ctx, raw: unknown) {
     recordIdempotency(ctx.db, input.idempotency_key, 'bind_project_location', input, id);
     audit(ctx.db, ctx.source, 'bind_project_location', input.host_id, null, null, { project_id, location_id: id });
     return { location: locationDto(ctx.db, getLocationRow(ctx.db, id)), replayed: false,
-      note: input.path ? 'Bound; nothing was created or copied. Run ssh_projects_preflight next.' : 'Path is unset; this location is not executable until a path is set.' };
+      note: input.path ? 'Bound; the manager created or copied nothing. Run ssh_projects_preflight next: its plan says how to create or update the folder.' : 'Path is unset; this location is not executable until a path is set.' };
   });
 }
 
@@ -853,11 +853,11 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
     steps: [
       `source: git -C ${posixQuote(local)} bundle create ${bundle} ${branch}`,
       `copy ${bundle} to the host as ${REMOTE_BUNDLE} (scp, recipe purpose:"file_transfer")`,
-      synced.length ? `host: cd ${r} && for p in ${synced.slice(0, 200).map(posixQuote).join(' ')}; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done  # only files an earlier sync copied uncommitted, unchanged since` : '',
+      synced.length ? `host: cd ${r} && for p in ${synced.slice(0, 200).map(posixQuote).join(' ')}; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done  # the manager checked these are exactly the uncommitted copies the last verified sync put here (nothing edited since); the incoming commits bring them back, untracked ones included` : '',
       `host: ${apply} && rm -f ${REMOTE_BUNDLE}${kind === 'clone' ? '' : '  # if git refuses, the destination has its own commits: stop and ask the user'}`,
       copy.length ? `copy the ${copy.length} uncommitted source file(s) in "copy" to the same relative paths` : '',
       crlf.length ? `host: cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}  # Windows line endings -> LF, as Git stores them` : '',
-      'verify_sync with source_snapshot and generations from this preflight',
+      'verify_sync with source_snapshot and generations from this preflight (no new preflight needed in between; verify re-reads both sides)',
     ].filter(Boolean),
   };
 }

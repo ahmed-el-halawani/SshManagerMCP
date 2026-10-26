@@ -336,12 +336,9 @@ export function connectionRecipe(ctx: Ctx, raw: unknown) {
   const authNote = p.auth === 'password'
     ? `Password auth: set the env vars in "env" for the ssh process. ssh then gets the password from the manager's askpass helper. The password is never shown to you; do not ask the user for it.${host.password_stored ? '' : ' NO PASSWORD IS STORED YET: ask the user to set it in the GUI.'}`
     : 'BatchMode=yes: no password prompts; use ssh-agent.';
-  const meta = {
-    host_id: row.id, host_revision: row.revision, identity_generation: row.identity_generation, environment: env, env: base.env, auth: p.auth ?? 'key',
-    status: host.status, trust: host.trust, known_hosts: p.mode === 'direct' ? knownHostsPath(ctx.dataDir) : 'user-managed (ssh_config)',
-    config_path: p.config_path ?? null, identity_file: p.mode === 'direct' ? p.identity_file ?? null : null,
-    instructions_note: 'Host instructions and default_remote_directory are NOT injected; read them via get_host and decide yourself.',
-  };
+  // Only what running the command needs: status, trust and instructions come from list/get_host (agents fetch a recipe per purpose,
+  // so every extra field here is paid twice per session).
+  const meta = { host_id: row.id, environment: env, env: base.env, auth: p.auth ?? 'key' };
   if (input.purpose === 'shell') {
     const argv = [splitCommand(s.ssh_path).at(-1)!, ...base.args, '--', base.destination];
     return { ...meta, executable: argv[0], argv, shell: env === 'windows-native' ? 'powershell' : 'posix', display: display(argv),
@@ -351,6 +348,5 @@ export function connectionRecipe(ctx: Ctx, raw: unknown) {
   const remoteHost = base.destination.includes(':') ? `[${base.destination}]` : base.destination;
   const scp = [splitCommand(s.scp_path).at(-1)!, ...base.args, '-r', '<local_path>', `${remoteHost}:<remote_path>`];
   return { ...meta, executable: scp[0], argv: scp, shell: env === 'windows-native' ? 'powershell' : 'posix', display: display(scp),
-    sftp_argv: [splitCommand(s.sftp_path).at(-1)!, ...base.args, base.destination],
-    notes: [authNote, 'scp/sftp use -P (capital) for port.', 'rsync is not assumed to exist on either side.', 'Replace <local_path>/<remote_path>; quote remote paths for the REMOTE shell.'] };
+    notes: [authNote, 'Replace <local_path>/<remote_path>; quote remote paths for the REMOTE shell. sftp takes the same options (-P for the port); rsync is not assumed.'] };
 }
