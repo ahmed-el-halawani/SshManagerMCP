@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { age, call, CallError, errText, idem } from './api.ts';
+import { age, call, CallError, checkHost, errText, idem } from './api.ts';
 
 type Status = { state: string; checked_at: string | null; stale: boolean; error_code: string | null };
 type HostSummary = { id: string; name: string; enabled: boolean; target: string; declared_os: string; observed_os: string | null; os_mismatch: boolean; tags: string[]; revision: number; status: Status; capability_keys: string[] };
@@ -59,7 +59,7 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
       for (const h of data.hosts.filter((x) => x.enabled && x.status.stale && x.status.state !== 'checking')) {
         if (running.current.size >= 2 || running.current.has(h.id)) continue;
         running.current.add(h.id);
-        setTimeout(() => call('checkHost', { host_id: h.id }).catch(() => {}).finally(() => running.current.delete(h.id)), Math.random() * 5000);
+        setTimeout(() => checkHost(h.id).catch(() => {}).finally(() => running.current.delete(h.id)), Math.random() * 5000);
       }
     }, 60_000);
     return () => clearInterval(t);
@@ -155,7 +155,7 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
         id = hostId;
       }
       if (f.auth === 'password' && f.password) await call('setHostPassword', { host_id: id, password: f.password });
-      if (andCheck) await call('checkHost', { host_id: id }).catch(() => {});
+      if (andCheck) await checkHost(id).catch(() => {});
       onDone(id);
     } catch (e) {
       if (e instanceof CallError && e.error.code === 'REVISION_CONFLICT') setConflict(true);
@@ -316,7 +316,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
       <div className="id">ID {h.id} · revision {h.revision} · identity generation {h.identity_generation}</div>
       <Err e={msg} />
       <div className="row">
-        <button className="primary" disabled={busy} onClick={() => act(async () => setLastCheck(await call('checkHost', { host_id: id })))}>Check now</button>
+        <button className="primary" disabled={busy} onClick={() => act(async () => { const r = await checkHost(id); setLastCheck(r); if (r.key_auth) setMsg(r.key_auth); })}>Check now</button>
         <button onClick={() => act(async () => { const r = await call('connectionRecipe', { host_id: id, caller_environment: env }); await copy(r.display); setMsg('SSH command copied to clipboard'); })}>Copy SSH command</button>
         <button onClick={() => act(async () => { const r = await call('connectionRecipe', { host_id: id, caller_environment: env, purpose: 'file_transfer' }); await copy(r.display); setMsg('scp template copied'); })}>Copy scp template</button>
         <button onClick={onEdit}>Edit</button>
@@ -330,7 +330,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
       {(h.status.state === 'trust_required' || h.status.state === 'host_key_changed') && !lastCheck?.trust_candidates && (
         <div className="error">
           {h.status.state === 'trust_required' ? 'This host\'s key is not trusted yet, so no login (password or key) is attempted.' : 'The host key CHANGED since it was trusted. Do not continue unless you know why.'}
-          {' '}<button disabled={busy} onClick={() => act(async () => setLastCheck(await call('checkHost', { host_id: id })))}>Show fingerprint to verify</button>
+          {' '}<button disabled={busy} onClick={() => act(async () => { const r = await checkHost(id); setLastCheck(r); if (r.key_auth) setMsg(r.key_auth); })}>Show fingerprint to verify</button>
         </div>
       )}
       {lastCheck?.trust_candidates && Array.isArray(lastCheck.trust_candidates) && (

@@ -32,6 +32,24 @@ export async function call<T = any>(method: string, arg?: unknown): Promise<T> {
 
 export const idem = () => `gui-${crypto.randomUUID()}`;
 
+/**
+ * Every GUI check goes through here. After the first successful check of a password host (the password works and the
+ * host key is trusted), move it to an SSH key once: password logins cost ~1.6 s each (askpass + DPAPI), key logins
+ * almost nothing. Tried once per host account, so a host that refuses keys is not retried on every check (the manual
+ * "Switch to SSH key" button stays). Agent (MCP) checks never do this.
+ */
+export async function checkHost(hostId: string): Promise<any> {
+  const r = await call('checkHost', { host_id: hostId });
+  if (!r.success || !['macos', 'linux'].includes(r.observed_os)) return r;
+  const h = await call('getHost', { host_id: hostId });
+  const flag = `sshrm.keyAuthTried.${hostId}.${h.identity_generation}`;
+  let tried = true;
+  try { tried = !!localStorage.getItem(flag); localStorage.setItem(flag, '1'); } catch { /* no storage: never auto-switch */ }
+  if (tried || h.auth !== 'password' || !h.password_stored || h.profile.mode !== 'direct') return r;
+  try { return { ...r, key_auth: (await call('switchToKeyAuth', { host_id: hostId })).note }; }
+  catch (e) { return { ...r, key_auth: `Stayed on password login: ${errText(e)}` }; }
+}
+
 export function errText(e: unknown): string {
   if (e instanceof CallError) {
     const x = e.error;
