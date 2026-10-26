@@ -202,6 +202,16 @@ test('same commit checked out with CRLF (Windows autocrlf) vs LF is ready via Gi
   const pre = await setup(crlf, dst).pre();
   assert.equal(pre.verdict, 'ready', JSON.stringify(pre.facts));
   assert.ok(pre.facts.some((f) => f.kind === 'filter_only_differences' && !f.blocking));
+
+  // an uncommitted edit copied from this CRLF checkout must be turned back to LF on the host (seen on a real Mac)
+  writeFileSync(join(crlf, 'a.txt'), 'line1\r\nline2\r\nwip\r\n');
+  writeFileSync(join(crlf, 'new.txt'), 'untracked\r\n'); // untracked text: autocrlf normalises it too
+  spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x'], { cwd: crlf }); // source moves on: revision_mismatch -> git plan
+  const plan = (await setup(crlf, dst).pre()).suggested_plan as { kind: string; copy: string[]; steps: string[] };
+  assert.equal(plan.kind, 'git_fast_forward');
+  assert.deepEqual(plan.copy.sort(), ['a.txt', 'new.txt']);
+  const eol = plan.steps.find((s) => s.includes('perl -pi'));
+  assert.ok(eol?.includes("'a.txt'") && eol.includes("'new.txt'"), JSON.stringify(plan.steps));
 });
 
 test('find on host: matches by folder and package name, ranks same Git repo first, rejects other repos', async () => {

@@ -427,6 +427,10 @@ echo "@@STATE exists"
 echo "@@CANON $(pwd -P)"
 if [ "$(pwd -P)" = / ] || [ "$(pwd -P)" = "$(cd -- "$HOME" && pwd -P)" ]; then echo "@@ROOTDIR 1"; exit 0; fi
 if command -v git >/dev/null 2>&1; then echo "@@GIT 1"; G=1; else echo "@@GIT 0"; G=0; fi
+if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; else H="shasum -a 256"; fi
+# Hashes and dirty blob ids ride in this same session: every SSH login costs a handshake (and askpass for password hosts).
+# Out-of-scope files and symlinks are hashed too and dropped by the manager (links are compared by target).
+hashes() { printf '@@HASHES\\n'; xargs -0 $H 2>/dev/null; printf '\\n@@END\\n'; }
 if [ "$G" = 1 ] && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
   T=$(git rev-parse --show-toplevel)
   echo "@@REPO 1"; echo "@@TOP $T"; echo "@@PREFIX $(git rev-parse --show-prefix)"
@@ -437,10 +441,14 @@ if [ "$G" = 1 ] && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true
   printf '@@STATUS\\n'; git -c core.quotepath=off status --porcelain=v2 -z --untracked-files=all -- .; printf '\\n@@END\\n'
   printf '@@FILES\\n'; git -c core.quotepath=off ls-files -z --cached --others --exclude-standard; printf '\\n@@END\\n'
   printf '@@INDEX\\n'; git -c core.quotepath=off ls-files -s -z; printf '\\n@@END\\n'
+  git -c core.quotepath=off ls-files -z --cached --others --exclude-standard | hashes
+  D=$(mktemp) && git -c core.quotepath=off ls-files -m -o --exclude-standard | while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] && printf '%s\\n' "$f"; done > "$D"
+  printf '@@DIRTYPATHS\\n'; cat "$D"; printf '\\n@@END\\n@@DIRTYIDS\\n'; [ -s "$D" ] && git hash-object --stdin-paths < "$D"; printf '\\n@@END\\n'; rm -f "$D"
   printf '@@STATUS2\\n'; git -c core.quotepath=off status --porcelain=v2 -z --untracked-files=all -- .; printf '\\n@@END\\n'
 else
   echo "@@REPO 0"
   printf '@@FILES\\n'; find . \\( ${prune} \\) -prune -o \\( -type f -o -type l \\) -print0; printf '\\n@@END\\n'
+  find . \\( ${prune} \\) -prune -o -type f -print0 | hashes
 fi
 printf '@@LINKS\\n'; find . \\( ${prune} \\) -prune -o -type l -print 2>/dev/null | while IFS= read -r l; do printf '%s\\t%s\\n' "$l" "$(readlink "$l")"; done; printf '@@END\\n'
 `;
@@ -495,28 +503,30 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
   const links = section(out, 'LINKS').split('\n').filter(Boolean).map((l) => { const [a, b] = l.split('\t'); return { p: a.replace(/^\.\//, ''), target: b ?? '' }; });
   const linkSet = new Set(links.map((l) => l.p));
   const { kept, excluded } = applyExclusions(files, isRepo, policy);
-  const toHash = kept.filter((f) => !linkSet.has(f));
-  const hashScript = `cd -- ${posixQuote(canonical)} || exit 3
-if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; else H="shasum -a 256"; fi
-xargs -0 $H 2>/dev/null; echo "@@DONE"`;
-  const hr = toHash.length
-    ? await sshRun(ctx, host, hashScript, s.inspect_timeout_s, { maxBytes: 64 << 20, input: toHash.join('\0') + '\0' })
-    : null;
-  if (hr && !hr.stdout.includes('@@DONE')) {
-    const c = classify(hr);
-    return { path_state: 'exists', canonical_path: canonical, home, git: facts, layout_issues: [], stable: false, error: { code: c.code, message: `hashing failed: ${c.message}`, diagnostics: diagnostics(hr) } };
+  const toHash = new Set(kept.filter((f) => !linkSet.has(f)));
+  if (toHash.size && !out.includes('@@HASHES\n')) {
+    const c = classify(r);
+    return { path_state: 'exists', canonical_path: canonical, home, git: facts, layout_issues: [], stable: false, error: { code: c.code, message: `hashing failed: ${c.message}`, diagnostics: diagnostics(r) } };
   }
   const entries: Entry[] = [];
-  for (const line of (hr?.stdout ?? '').split('\n')) {
-    const m = /^(\\?)([0-9a-f]{64}) [ *](.*)$/.exec(line.replace(/\r$/, ''));
+  for (const line of section(out, 'HASHES').split('\n')) {
+    const m = /^(\\?)([0-9a-f]{64}) [ *](.*)$/.exec(line);
     if (!m || m[3] === '-') continue;
-    const name = m[1] ? m[3].replaceAll('\\n', '\n').replaceAll('\\\\', '\\') : m[3];
-    entries.push({ p: name.replace(/^\.\//, ''), t: 'f', h: m[2] });
+    const name = (m[1] ? m[3].replaceAll('\\n', '\n').replaceAll('\\\\', '\\') : m[3]).replace(/^\.\//, '');
+    if (toHash.has(name)) entries.push({ p: name, t: 'f', h: m[2] });
   }
   const keptSet = new Set(kept);
   const scopedLinks = links.filter((x) => keptSet.has(x.p)); // ignored build output (ios/.symlinks, ephemeral/) is out of scope
   for (const l of scopedLinks) entries.push({ p: l.p, t: 'l', h: sha(l.target) });
-  if (isRepo) await addGitBlobIds(entries, parseIndex(section(out, 'INDEX')), dirty, (input) => sshRun(ctx, host, `cd -- ${posixQuote(canonical)} && git hash-object --stdin-paths`, s.inspect_timeout_s, { maxBytes: 64 << 20, input }));
+  if (isRepo) {
+    // blob ids of dirty files were computed in the same session; anything missing falls back to byte comparison
+    const dp = section(out, 'DIRTYPATHS').split('\n').filter(Boolean), di = section(out, 'DIRTYIDS').split('\n').filter(Boolean);
+    const known = dp.length === di.length ? new Map(dp.map((p, i) => [p, di[i]])) : new Map<string, string>();
+    await addGitBlobIds(entries, parseIndex(section(out, 'INDEX')), dirty, async (input) => {
+      const ids = input.split('\n').filter(Boolean).map((p) => known.get(p));
+      return ids.every(Boolean) ? { stdout: ids.join('\n'), exit_code: 0 } : { stdout: '', exit_code: 1 };
+    });
+  }
   return {
     path_state: 'exists', canonical_path: canonical, home, git: facts, stable: !isRepo || section(out, 'STATUS2') === status,
     layout_issues: layoutIssues(kept, scopedLinks, keptSet.has('.gitmodules'), false), manifest: finishManifest(entries, excluded),
@@ -823,6 +833,15 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
   const bundle = process.platform === 'win32' ? '$env:TEMP\\sshrm-sync.bundle' : '/tmp/sshrm-sync.bundle';
   const inScope = new Set(src.manifest?.entries.map((e) => e.p));
   const copy = underSubdir(src.git!.dirty_paths, src.git!.subdir).filter((p) => inScope.has(p));
+  // A copied working-tree file carries this checkout's bytes: a Windows autocrlf checkout has CRLF where Git (and the host)
+  // has LF. Where Git's blob id differs from the raw bytes' blob id, Git normalised the file: undo the CRLF on the host.
+  const blobOf = new Map(src.manifest?.entries.map((e) => [e.p, e.g]));
+  const crlf = copy.filter((p) => {
+    try {
+      const bytes = readFileSync(join(local, p));
+      return blobOf.get(p) && bytes.includes(13) && createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== blobOf.get(p);
+    } catch { return false; } // source not on this PC
+  });
   const r = posixQuote(root);
   const apply = {
     clone: `git clone -q -b ${branch} ${REMOTE_BUNDLE} ${r}`,
@@ -837,6 +856,7 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
       synced.length ? `host: cd ${r} && for p in ${synced.slice(0, 200).map(posixQuote).join(' ')}; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done  # only files an earlier sync copied uncommitted, unchanged since` : '',
       `host: ${apply} && rm -f ${REMOTE_BUNDLE}${kind === 'clone' ? '' : '  # if git refuses, the destination has its own commits: stop and ask the user'}`,
       copy.length ? `copy the ${copy.length} uncommitted source file(s) in "copy" to the same relative paths` : '',
+      crlf.length ? `host: cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}  # Windows line endings -> LF, as Git stores them` : '',
       'verify_sync with source_snapshot and generations from this preflight',
     ].filter(Boolean),
   };
