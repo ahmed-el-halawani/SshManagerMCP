@@ -9,7 +9,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { createCore, createLogger, errorPayload } from '../core/index.ts';
-import { ConsistencyPolicy, HostPatch, IdemKey, LocationSpec, Metadata, Profile, CapabilityInput } from '../core/schemas.ts';
+import { ConsistencyPolicy, HostPatch, Uuid, IdemKey, LocationSpec, Metadata, Profile, CapabilityInput } from '../core/schemas.ts';
 
 const core = createCore({ source: 'mcp' });
 const log = createLogger(core.dataDir, 'mcp');
@@ -38,6 +38,9 @@ const RO: Ann = { readOnlyHint: true, openWorldHint: false };
 const RO_NET: Ann = { readOnlyHint: true, openWorldHint: true };
 const WRITE: Ann = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
+/** What the agent reads, so it costs tokens: compact JSON without null/empty-string fields (an absent field means null). */
+const lean = (v: unknown) => JSON.stringify(v, (_k, x) => (x === null || x === '' ? undefined : x));
+
 function tool<S extends z.ZodObject>(name: string, description: string, schema: S, annotations: Ann, fn: (i: z.infer<S>) => unknown | Promise<unknown>) {
   server.registerTool(name, { description, inputSchema: schema, annotations }, (async (input: z.infer<S>) => {
     const started = Date.now();
@@ -46,16 +49,19 @@ function tool<S extends z.ZodObject>(name: string, description: string, schema: 
       log('info', name, { ms: Date.now() - started });
       // A failed check is a successful tool call whose result says success:false. Mark it as an error so clients don't read it as success.
       const failed = result && typeof result === 'object' && result.success === false;
-      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 1) }], structuredContent: result, ...(failed ? { isError: true } : {}) };
+      const text = lean(result);
+      return { content: [{ type: 'text' as const, text }], structuredContent: JSON.parse(text), ...(failed ? { isError: true } : {}) };
     } catch (e) {
       const error = errorPayload(e);
       log('warn', name, { code: error.code, ms: Date.now() - started });
-      return { content: [{ type: 'text' as const, text: JSON.stringify({ error }, null, 1) }], structuredContent: { error }, isError: true };
+      return { content: [{ type: 'text' as const, text: lean({ error }) }], structuredContent: { error }, isError: true };
     }
   }) as never);
 }
 
-const uuid = z.uuid();
+const uuid = Uuid;
+/** Integer without the ±2^53 bounds z.number().int() writes into every schema. */
+const int = z.number().refine(Number.isInteger, 'must be an integer');
 
 // ---- hosts ----
 tool('ssh_hosts_parse_connection_input', 'Parse a simple `ssh user@host -p N -i key` command or alias into a draft profile. Pure: no network, no execution. Rejects pipes, $(), remote commands and ProxyCommand.',
@@ -65,7 +71,7 @@ tool('ssh_hosts_register', 'Register a host (saved even if offline; no network).
   z.object({ profile: Profile, metadata: Metadata, capabilities: z.array(CapabilityInput).max(100).optional(), idempotency_key: IdemKey }), WRITE, (i) => core.registerHost(i));
 
 tool('ssh_hosts_update', 'Patch a host. Requires expected_revision. Changing endpoint/user/alias/config invalidates previous check and trust state. capabilities/resources are typed upsert/remove patches.',
-  z.object({ host_id: uuid, expected_revision: z.number().int(), patch: HostPatch, idempotency_key: IdemKey }), WRITE, (i) => core.updateHost(i));
+  z.object({ host_id: uuid, expected_revision: int, patch: HostPatch, idempotency_key: IdemKey }), WRITE, (i) => core.updateHost(i));
 
 tool('ssh_hosts_list', 'List host summaries with last-known status and its age. No secrets, no long instructions.',
   z.object({ cursor: z.string().optional(), limit: z.number().int().min(1).max(100).optional(), query: z.string().max(200).optional(), tag: z.string().max(50).optional(), enabled: z.boolean().optional() }), RO, (i) => core.listHosts(i));
@@ -90,7 +96,7 @@ tool('ssh_hosts_list_directory', 'Read-only: list sub-folders of a path on a POS
   z.object({ host_id: uuid, path: z.string().max(4096).optional() }), RO_NET, (i) => core.listRemoteDir(i));
 
 tool('ssh_hosts_approve_host_key', 'Trust a host key. ONLY call after the USER explicitly confirmed this fingerprint matches one read from the machine itself. A LAN keyscan is not proof.',
-  z.object({ host_id: uuid, fingerprint: z.string(), algorithm: z.string(), expected_identity_generation: z.number().int() }), { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.approveHostKey(i));
+  z.object({ host_id: uuid, fingerprint: z.string(), algorithm: z.string(), expected_identity_generation: int }), { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.approveHostKey(i));
 
 tool('ssh_hosts_setup_build_keychain', 'macOS hosts whose user chose the "build keychain" signing mode: (re)create the separate signing keychain automatically (copies code-signing identities from the login keychain using the stored password; no user interaction). ' +
   'Normally not needed: the signing runner does it on first use. Call it after the user renewed their certificate or when the runner reports the build keychain is broken. You cannot change the signing mode; only the user can, in the GUI.',
@@ -100,7 +106,7 @@ tool('ssh_hosts_check_signing', 'macOS hosts: is code signing over SSH ready? Ch
   z.object({ host_id: uuid }), RO_NET, (i) => core.checkSigning(i));
 
 tool('ssh_hosts_remove', 'Remove the local registry record only. Does not touch the remote machine, keys or ssh config.',
-  z.object({ host_id: uuid, expected_revision: z.number().int() }), { readOnlyHint: false, destructiveHint: true, openWorldHint: false }, (i) => core.removeHost(i));
+  z.object({ host_id: uuid, expected_revision: int }), { readOnlyHint: false, destructiveHint: true, openWorldHint: false }, (i) => core.removeHost(i));
 
 // ---- projects ----
 tool('ssh_projects_register', 'Register a project with its source location (default: a path on this PC, host_id null). Nothing is cloned or created. Check ssh_projects_list first: reuse existing projects across sessions.',
@@ -120,14 +126,14 @@ tool('ssh_projects_bind_location', 'Bind a project to a path on a host (adopt an
   'Only do that when the user asked for a separate setup; if the existing copy merely moved, use ssh_projects_update_location on the source instead. Destination folders may not overlap another setup (PATH_OVERLAP).',
   z.object({ project_id: uuid, host_id: uuid.nullable(), path: z.string().nullable().optional(), mode: z.enum(['adopt_existing', 'create_if_missing']).optional(), label: z.string().optional(),
     source_path: z.string().optional(), source_location_id: uuid.optional(),
-    policy: ConsistencyPolicy.partial().optional(), expected_project_revision: z.number().int(), idempotency_key: IdemKey }), WRITE, (i) => core.bindProjectLocation(i));
+    policy: ConsistencyPolicy.partial().optional(), expected_project_revision: int, idempotency_key: IdemKey }), WRITE, (i) => core.bindProjectLocation(i));
 
 tool('ssh_projects_update_location', 'Edit/clear a location path, label, mode or policy; or confirm_identity after the user accepted a fork/renamed remote. Invalidates old verification; never moves or deletes files.',
-  z.object({ location_id: uuid, expected_revision: z.number().int(), idempotency_key: IdemKey, patch: z.object({ path: z.string().nullable().optional(), label: z.string().optional(), enabled: z.boolean().optional(),
+  z.object({ location_id: uuid, expected_revision: int, idempotency_key: IdemKey, patch: z.object({ path: z.string().nullable().optional(), label: z.string().optional(), enabled: z.boolean().optional(),
     mode: z.enum(['adopt_existing', 'create_if_missing']).optional(), policy: ConsistencyPolicy.partial().optional(), confirm_identity: z.boolean().optional() }) }), WRITE, (i) => core.updateProjectLocation(i));
 
 tool('ssh_projects_unbind_location', 'Remove a location binding (metadata only; no directory is touched).',
-  z.object({ location_id: uuid, expected_revision: z.number().int() }), { readOnlyHint: false, destructiveHint: true, openWorldHint: false }, (i) => core.unbindProjectLocation(i));
+  z.object({ location_id: uuid, expected_revision: int }), { readOnlyHint: false, destructiveHint: true, openWorldHint: false }, (i) => core.unbindProjectLocation(i));
 
 tool('ssh_projects_inspect', 'Read-only inspection of locations: path state, Git root/branch/HEAD/dirty/conflicts, content manifest digest. No fetch/pull/checkout/mkdir.',
   z.object({ project_id: uuid, location_ids: z.array(uuid).max(10).optional() }), RO_NET, (i) => core.inspectProject(i));
@@ -136,12 +142,14 @@ tool('ssh_projects_preflight', 'REQUIRED before build/run/test on a destination:
   'verdict for FILES (ready | path_unset | wrong_repository | branch_mismatch | revision_mismatch | destination_dirty | content_mismatch | ...), ready_for_intent (files AND toolchain), facts, and a non-destructive plan. ' +
   'Changes made on the destination after the last verified sync are protected: destination_dirty = uncommitted there, destination_ahead = committed there (compare commits, not git status). ' +
   'To run the destination checkout as it is (the user chose to keep its own commits), pass basis:"destination": execution.verdict then covers only that checkout and execution.commit records what you run; do not transfer files. ' +
-  'For build/run/test it compares Flutter/Dart on both sides with pubspec constraints (read-only). device/test_tool are not_checked. Summary output is compact; detail:"full" for every path.',
+  'For build/run/test it compares Flutter/Dart on both sides with pubspec constraints (read-only). device/test_tool are not_checked. ' +
+  'With Git on the source, suggested_plan.steps are exact commands (bundle the branch, copy it, clone / fetch+switch / fast-forward on the host, copy only the uncommitted files in "copy"): run them, then verify_sync. ' +
+  'Summary output is compact (absent field = null); detail:"full" for every path, ids and raw inspections.',
   z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string().optional(), intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).optional(),
     detail: z.enum(['summary', 'full']).optional(), basis: z.enum(['source', 'destination']).optional() }), RO_NET, (i) => core.preflightProject(i));
 
 tool('ssh_projects_verify_sync', 'After YOU transferred files, have the manager re-read both sides and verify the destination matches expected_source_snapshot. Your own claim of success is not evidence.',
-  z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string(), operation_id: z.string(), expected_generations: z.object({ source: z.number().int(), destination: z.number().int() }), transfer_mode: z.string().optional() }),
+  z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string(), operation_id: z.string(), expected_generations: z.object({ source: int, destination: int }), transfer_mode: z.string().optional() }),
   { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.verifyProjectSync(i));
 
 tool('ssh_projects_acquire_lease', 'Acquire/renew a short coordination lease on a destination before transferring. Not a filesystem lock.',

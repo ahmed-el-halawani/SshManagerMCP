@@ -48,17 +48,37 @@ test('matching existing checkout is reused as ready; a new session rediscovers t
   assert.equal(found[0].locations.find((l) => l.id === loc.id)!.path_input, posixPath(dst));
 });
 
-test('same branch, different commit is not ready; plan moves commits without a cloud remote', async () => {
+test('Git on both sides: following the plan literally (bundle, fast-forward, uncommitted copies) reaches verified', async () => {
   const src = tempRepo();
   const dst = cloneTo(src);
-  writeFileSync(join(src, 'a.txt'), 'changed\n');
-  git(src, 'commit', '-qam', 'second');
-  const { pre } = setup(src, dst);
-  const r = await pre();
+  const { core, project, loc, pre } = setup(src, dst);
+  const sh = (cmd: string) => { const r = spawnSync(process.env.FAKE_SH ?? 'C:\\Program Files\\Git\\bin\\sh.exe', ['-c', cmd], { encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd}\n${r.stderr}`); };
+  const verify = async (r: Pre) => (await core.verifyProjectSync({ project_id: project.id, destination_location_id: loc.id, expected_source_snapshot: r.source_snapshot, operation_id: key(), expected_generations: r.generations }) as Verify).outcome;
+  /** An agent: bundle on the source, run every "host:" step as pasted, copy the listed uncommitted files. */
+  const follow = (plan: Pre['suggested_plan'] & { steps: string[] }) => {
+    sh(`git -C '${posixPath(src)}' bundle create /tmp/sshrm-sync.bundle main`);
+    for (const s of plan.steps) if (s.startsWith('host: ')) sh(s.slice(6));
+    for (const p of plan.copy ?? []) copyFileSync(join(src, p), join(dst, p));
+  };
+
+  // uncommitted source work is copied by hand and verified
+  writeFileSync(join(src, 'a.txt'), 'wip\n');
+  writeFileSync(join(src, 'new.txt'), 'untracked\n');
+  let r = await pre();
+  assert.equal(r.verdict, 'content_mismatch');
+  for (const p of r.suggested_plan.copy ?? []) copyFileSync(join(src, p), join(dst, p));
+  assert.equal(await verify(r), 'verified');
+
+  // the source commits that work: the destination still holds it uncommitted, which would make --ff-only refuse
+  git(src, 'add', '-A');
+  git(src, 'commit', '-qm', 'second');
+  r = await pre();
   assert.equal(r.verdict, 'revision_mismatch');
-  assert.ok(kinds(r).includes('content_mismatch'));
-  assert.equal(r.suggested_plan.kind, 'incremental_transfer');
-  assert.deepEqual(r.suggested_plan.copy, ['a.txt']);
+  assert.equal(r.suggested_plan.kind, 'git_fast_forward');
+  assert.deepEqual(r.suggested_plan.copy, []);
+  follow(r.suggested_plan as never);
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.equal((await pre()).verdict, 'ready');
 });
 
 test('same commit with different uncommitted files on destination is not ready and is protected', async () => {
@@ -162,9 +182,12 @@ test('Git source vs plain-copy destination: tracked build/ files are out of scop
   const dst = join(mkdtempSync(join(tmpdir(), 'sshrm-copy-')), 'app');
   mkdirSync(join(dst, 'lib'), { recursive: true });
   writeFileSync(join(dst, 'lib', 'a.dart'), 'main(){}\n');
-  const r = await setup(src, dst).pre();
+  const { core, project, loc, pre } = setup(src, dst);
+  const r = await pre();
   assert.equal(r.verdict, 'ready', JSON.stringify(r.facts));
-  assert.ok(r.facts.some((f) => f.kind === 'scope_difference' && !f.blocking && f.paths?.includes('android/build/report.html')));
+  assert.ok(r.facts.some((f) => f.kind === 'scope_difference' && !f.blocking && !f.paths), 'summary leaves out paths of non-blocking facts');
+  const full = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, detail: 'full' }) as Pre;
+  assert.ok(full.facts.some((f) => f.kind === 'scope_difference' && f.paths?.includes('android/build/report.html')));
 });
 
 test('same commit checked out with CRLF (Windows autocrlf) vs LF is ready via Git blob ids', async () => {

@@ -28,19 +28,20 @@ export async function sshRun(ctx: Ctx, row: HostRow, cmd: string, timeoutS: numb
   return r;
 }
 
-type OsResult = { ok: true; os: 'macos' | 'linux' | 'windows' | 'unknown'; detail: string; shell: 'posix' | 'windows' } | { ok: false; run: RunResult };
+type OsResult = { ok: true; os: 'macos' | 'linux' | 'windows' | 'unknown'; detail: string; shell: 'posix' | 'windows'; out?: string } | { ok: false; run: RunResult };
 
 /** OS bootstrap: POSIX first unless hinted Windows; fallback once. A failed POSIX command on Windows is not an auth failure. */
 async function detectOs(ctx: Ctx, row: HostRow, timeoutS: number): Promise<OsResult> {
   const hint = row.observed_os ?? row.declared_os;
   const tryPosix = async (): Promise<OsResult | 'fallback'> => {
     const m = marker();
-    const r = await sshRun(ctx, row, `echo ${m}; uname -sr`, timeoutS);
+    // macOS session checks ride along in the same connection: every SSH login costs a handshake (and askpass + DPAPI for password hosts)
+    const r = await sshRun(ctx, row, `echo ${m}; uname -sr; [ "$(uname)" = Darwin ] && { ${MACOS_SESSION_SCRIPT}; }`, timeoutS);
     const ls = lines(r.stdout);
     if (r.stdout_truncated) return { ok: false, run: r };
     if (!ls.includes(m)) return r.exit_code === 255 || r.timed_out || r.spawn_error ? { ok: false, run: r } : 'fallback';
     const u = ls[ls.indexOf(m) + 1] ?? '';
-    if (/^Darwin/.test(u)) return { ok: true, os: 'macos', detail: u, shell: 'posix' };
+    if (/^Darwin/.test(u)) return { ok: true, os: 'macos', detail: u, shell: 'posix', out: r.stdout };
     if (/^Linux/.test(u)) return { ok: true, os: 'linux', detail: u, shell: 'posix' };
     if (/^(MINGW|MSYS|CYGWIN)/.test(u)) return { ok: true, os: 'windows', detail: u, shell: 'posix' };
     if (u && !/not recognized|not found/i.test(u + r.stderr)) return { ok: true, os: 'unknown', detail: u, shell: 'posix' };
@@ -113,7 +114,7 @@ export async function checkHost(ctx: Ctx, raw: unknown) {
   }
   const checked_at = now();
   if (res.ok) {
-    const warnings = res.os === 'macos' ? await macosSessionWarnings(ctx, row, s.check_timeout_s) : [];
+    const warnings = res.os === 'macos' ? macosSessionWarnings(res.out ?? '') : [];
     const applied = finishCheck(ctx, row, checkId, started, 'success', null, { shell: res.shell, warnings }, res);
     return {
       success: true, check_id: checkId, host_id, checked_at, state: 'reachable', applied_to_current_profile: applied, warnings,
@@ -123,6 +124,9 @@ export async function checkHost(ctx: Ctx, raw: unknown) {
     };
   }
   const c = classify(res.run);
+  if (c.code === 'AUTH_REQUIRED') c.next_action = profileOf(row).auth === 'password'
+    ? 'The host rejected the stored username/password. Ask the user to correct them in the SSH Resource Manager app (host → Edit). Never ask for the password in chat.'
+    : 'Load the key into ssh-agent (ssh-add) or set identity_file on the host.';
   const diag = diagnostics(res.run);
   const applied = finishCheck(ctx, row, checkId, started, 'failure', c.code, diag);
   const candidates = c.code === 'TRUST_REQUIRED' ? await candidateFingerprints(ctx, profileOf(row)).catch((e) => ({ error: String(e.message ?? e) })) : undefined;
@@ -140,15 +144,16 @@ export type SessionWarning = { code: string; message: string; fix: string };
  * sessions unless "Allow full disk access for remote users" is on, and a login profile that
  * sources files from there breaks every tool it was meant to set up (flutter, pod, node...).
  */
-async function macosSessionWarnings(ctx: Ctx, row: HostRow, timeoutS: number): Promise<SessionWarning[]> {
-  const r = await sshRun(ctx, row, `for d in Documents Desktop Downloads; do [ -d "$HOME/$d" ] && { ls "$HOME/$d" >/dev/null 2>&1 || echo "@@TCC $d"; }; done
-zsh -lc true 2>&1 | grep -i "not permitted" | head -n 3 | sed 's/^/@@PROFILE /'; echo @@END`, timeoutS);
-  if (!r.stdout.includes('@@END')) return [];
+const MACOS_SESSION_SCRIPT = `for d in Documents Desktop Downloads; do [ -d "$HOME/$d" ] && { ls "$HOME/$d" >/dev/null 2>&1 || echo "@@TCC $d"; }; done
+zsh -lc true 2>&1 | grep -i "not permitted" | head -n 3 | sed 's/^/@@PROFILE /'; echo @@END`;
+
+function macosSessionWarnings(stdout: string): SessionWarning[] {
+  if (!stdout.includes('@@END')) return [];
   const out: SessionWarning[] = [];
-  const blocked = [...r.stdout.matchAll(/^@@TCC (\w+)/gm)].map((m) => `~/${m[1]}`);
+  const blocked = [...stdout.matchAll(/^@@TCC (\w+)/gm)].map((m) => `~/${m[1]}`);
   if (blocked.length) out.push({ code: 'MACOS_PRIVACY_BLOCKED', message: `SSH sessions cannot read ${blocked.join(', ')} (macOS privacy/TCC). Tools, SDKs or projects stored there are invisible over SSH.`,
     fix: 'On the Mac: System Settings → General → Sharing → Remote Login (i) → enable "Allow full disk access for remote users". Or keep projects/tools outside those folders.' });
-  const profile = [...r.stdout.matchAll(/^@@PROFILE (.+)$/gm)].map((m) => m[1].trim());
+  const profile = [...stdout.matchAll(/^@@PROFILE (.+)$/gm)].map((m) => m[1].trim());
   if (profile.length) out.push({ code: 'LOGIN_PROFILE_ERROR', message: `The login shell profile fails over SSH: ${profile[0].slice(0, 200)}`,
     fix: 'Tools it adds to PATH (flutter, pod, node, brew) may be missing in SSH commands. Fix the profile, enable full disk access, or call tools by absolute path (see probe results).' });
   return out;

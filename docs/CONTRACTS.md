@@ -4,7 +4,7 @@
 SQLite (`node:sqlite`, built into Node/Electron, so there is no native module and no ABI split). WAL mode, `busy_timeout=5000`, foreign keys on, short `BEGIN IMMEDIATE` transactions. No transaction is held while waiting on the network. Migrations are versioned through `PRAGMA user_version` (see `src/core/db.ts`): v1 has hosts, capabilities, resources, checks, check leases, idempotency, audit and trust; v2 adds projects, locations, inspections, sync_verifications and leases.
 
 ## MCP tools
-All tool inputs are runtime-validated with Zod (strict objects, so unknown fields such as `password` are rejected). Results come back as `structuredContent` plus the same JSON as text. Operational failures return `isError: true` with `{error: {code, message, retryable, next_action, ...}}`.
+All tool inputs are runtime-validated with Zod (strict objects, so unknown fields such as `password` are rejected). Results come back as compact JSON text plus the same object as `structuredContent`; null and empty-string fields are left out (absent = null), because every byte is agent context. Id fields are plain strings in the published schemas (validated as UUIDs at runtime) so the tool list stays small. Operational failures return `isError: true` with `{error: {code, message, retryable, next_action, ...}}`.
 
 | Tool | Notes |
 |---|---|
@@ -43,7 +43,8 @@ Error codes: `VALIDATION_ERROR NOT_FOUND REVISION_CONFLICT IDEMPOTENCY_CONFLICT 
     - It is computed from the shallowest `pubspec.yaml`: environment `sdk`/`flutter` constraints and the `.fvmrc` pin.
     - It reads the SDKs from `bin/cache/flutter.version.json`, or from `flutter --version --machine` when that file is missing. It never runs `pub get`.
   - `ready_for_intent` is false when the toolchain is `missing` or `incompatible`.
-- **Output:** `detail: "summary"` (the default) leaves out the raw per-side inspections, and `"full"` includes them.
+- **Output:** `detail: "summary"` (the default) leaves out the raw per-side inspections, location/host ids, inspection ids, timestamps other than `ready_until`, the toolchain block when it was not checked, and `paths` of non-blocking facts. `"full"` includes all of it.
+- **Git plans:** when the source is a Git repo on a branch (and the destination is missing or also a Git repo), `path_missing` (create_if_missing), `branch_mismatch` and `revision_mismatch` return `git_clone` / `git_switch` / `git_fast_forward`: exact `source:` and `host:` commands (bundle the branch, copy it to `/tmp/sshrm-sync.bundle`, clone / `fetch b:b && switch` / `fetch && merge --ff-only`), and `copy` = only the source's uncommitted files. Files a previous verified sync copied there uncommitted (unchanged since) are restored first, or git would refuse to update over them. Git refuses non-fast-forward updates, so destination commits are never overwritten.
 - **Scope:** `git ls-files --cached --others --exclude-standard` (tracked plus non-ignored untracked files). Credentials (`.env*`, `*.pem`, keys) are always excluded. Non-Git projects also exclude `node_modules`, `build`, `dist`, `Pods`, `.dart_tool`, `.gradle`, `DerivedData`, `__pycache__`, `.venv` and `.git`. Project-specific globs go in `policy.exclusions`.
 - **Stale files:** a destination file that a previous verified sync copied but the source no longer has is reported as stale-owned. Unknown extra files block `ready` until the user decides.
 - **Default policy:** `source_snapshot` mode, same branch required, detached HEAD blocked, readiness valid for 60 s.
@@ -65,7 +66,7 @@ Error codes: `VALIDATION_ERROR NOT_FOUND REVISION_CONFLICT IDEMPOTENCY_CONFLICT 
 ## Password authentication (migrations 3, 6)
 - **Profile:** `auth: "key" | "password"` (default `key`).
 - **Storage:** the password is set only through the GUI (`setHostPassword`; no MCP tool exists) and stored as a DPAPI (CurrentUser) blob in `host_secrets`.
-- **ssh options for password hosts:** `BatchMode=no`, `PreferredAuthentications=password,keyboard-interactive`, `PubkeyAuthentication=no`, `NumberOfPasswordPrompts=1`, `StrictHostKeyChecking=yes`. The env sets `SSH_ASKPASS=<data-dir>\askpass.cmd`, `SSH_ASKPASS_REQUIRE=force` and `SSHRM_HOST_ID`. No TTY is involved, so nothing can hang on a prompt.
+- **ssh options for password hosts:** `BatchMode=no`, `PreferredAuthentications=password,keyboard-interactive`, `PubkeyAuthentication=no`, `NumberOfPasswordPrompts=1`, `StrictHostKeyChecking=yes`. The env sets `SSH_ASKPASS=<data-dir>\askpass.cmd`, `SSH_ASKPASS_REQUIRE=force` and `SSHRM_HOST_ID`. No TTY is involved, so nothing can hang on a prompt. The helper answers **once per ssh connection**: after a wrong password ssh falls back from `password` to `keyboard-interactive` and asks again, and Windows OpenSSH (which runs each askpass through a helper `ssh.exe` child when it has no console) then hangs until the timeout. A second prompt is refused, so a wrong password is a fast `AUTH_REQUIRED` and one failed login on the server, not a 15 s `CONNECTION_TIMEOUT`.
 - **Recipes:** return the same `env` and never the password.
 - **Lifecycle:** changing a profile identity field deletes the secret. `auth`, `identity_file` and `identities_only` are **not** identity fields: they say how to log in to the same account, so changing them keeps trust, secrets and bound locations.
 - **Switch to SSH key (GUI only, `switchToKeyAuth`; no MCP tool):** direct macOS/Linux hosts with a stored password.

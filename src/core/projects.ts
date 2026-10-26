@@ -163,7 +163,7 @@ export function bindProjectLocation(ctx: Ctx, raw: unknown) {
     recordIdempotency(ctx.db, input.idempotency_key, 'bind_project_location', input, id);
     audit(ctx.db, ctx.source, 'bind_project_location', input.host_id, null, null, { project_id, location_id: id });
     return { location: locationDto(ctx.db, getLocationRow(ctx.db, id)), replayed: false,
-      note: input.path ? 'Bound as adopt-existing; nothing was created or copied. Run inspect_project next.' : 'Path is unset; this location is not executable until a path is set.' };
+      note: input.path ? 'Bound; nothing was created or copied. Run ssh_projects_preflight next.' : 'Path is unset; this location is not executable until a path is set.' };
   });
 }
 
@@ -806,15 +806,54 @@ function verdictOf(facts: Fact[]) {
   return VERDICT_ORDER.find((v) => blocking.includes(v)) ?? 'ready';
 }
 
+const REMOTE_BUNDLE = '/tmp/sshrm-sync.bundle';
+
+/**
+ * Git source + Git (or missing) destination: committed work travels as a bundle of the source branch (no cloud remote
+ * needed, history kept, the destination's own work is never overwritten: fetch refuses non-fast-forward). Only the
+ * source's uncommitted files are copied by hand.
+ */
+function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, root: string, dst?: Inspection, diff?: ReturnType<typeof compare>['diff']) {
+  const branch = src.git!.branch!;
+  // Uncommitted files a previous sync copied here (unchanged since; anything edited here is destination_dirty and never
+  // reaches this plan). Once the source commits them, git refuses to fetch/switch over them, so put them back first.
+  const touched = new Set([...(diff?.since_verified_sync?.remote_only ?? []), ...(diff?.since_verified_sync?.both ?? [])]);
+  const synced = dst?.git && diff?.since_verified_sync ? underSubdir(dst.git.dirty_paths, dst.git.subdir).filter((p) => !touched.has(p)) : [];
+  const local = src.canonical_path ?? '<source>';
+  const bundle = process.platform === 'win32' ? '$env:TEMP\\sshrm-sync.bundle' : '/tmp/sshrm-sync.bundle';
+  const inScope = new Set(src.manifest?.entries.map((e) => e.p));
+  const copy = underSubdir(src.git!.dirty_paths, src.git!.subdir).filter((p) => inScope.has(p));
+  const r = posixQuote(root);
+  const apply = {
+    clone: `git clone -q -b ${branch} ${REMOTE_BUNDLE} ${r}`,
+    switch: `git -C ${r} fetch -q ${REMOTE_BUNDLE} ${branch}:${branch} && git -C ${r} switch -q ${branch}`,
+    fast_forward: `git -C ${r} fetch -q ${REMOTE_BUNDLE} ${branch} && git -C ${r} merge -q --ff-only FETCH_HEAD`,
+  }[kind];
+  return {
+    kind: `git_${kind}`, copy, copy_count: copy.length,
+    steps: [
+      `source: git -C ${posixQuote(local)} bundle create ${bundle} ${branch}`,
+      `copy ${bundle} to the host as ${REMOTE_BUNDLE} (scp, recipe purpose:"file_transfer")`,
+      synced.length ? `host: cd ${r} && for p in ${synced.slice(0, 200).map(posixQuote).join(' ')}; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done  # only files an earlier sync copied uncommitted, unchanged since` : '',
+      `host: ${apply} && rm -f ${REMOTE_BUNDLE}${kind === 'clone' ? '' : '  # if git refuses, the destination has its own commits: stop and ask the user'}`,
+      copy.length ? `copy the ${copy.length} uncommitted source file(s) in "copy" to the same relative paths` : '',
+      'verify_sync with source_snapshot and generations from this preflight',
+    ].filter(Boolean),
+  };
+}
+
 function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: LocationRow, diff: ReturnType<typeof compare>['diff']) {
   const root = dst.canonical_path ?? dest.path_input ?? '<path>';
   const steps: string[] = [];
+  const srcGit = !!src.git?.is_repo && !!src.git.branch;
+  const bothGit = srcGit && !!dst.git?.is_repo;
   switch (verdict) {
     case 'ready': return { kind: 'none', steps: ['Run your build/test from the verified path; re-run preflight before the next build.'] };
     case 'path_unset': return { kind: 'set_path', steps: ['Ask the user for the destination path, then update_project_location. Do not invent one.'] };
-    case 'path_missing': return dest.mode === 'create_if_missing'
-      ? { kind: 'create_then_transfer', steps: [`With the user's explicit choice: mkdir -p ${posixQuote(root)} via ssh`, 'Transfer the source scope', 'verify_project_sync'] }
-      : { kind: 'fix_path', steps: ['The adopted path does not exist. Ask the user for the correct existing path, or switch mode to create_if_missing explicitly.'] };
+    case 'path_missing': return dest.mode !== 'create_if_missing'
+      ? { kind: 'fix_path', steps: ['The adopted path does not exist. Ask the user for the correct existing path, or switch mode to create_if_missing explicitly.'] }
+      : srcGit ? gitPlan('clone', src, root)
+      : { kind: 'create_then_transfer', steps: [`With the user's explicit choice: mkdir -p ${posixQuote(root)} via ssh`, 'Transfer the source scope', 'verify_project_sync'] };
     case 'wrong_repository': return { kind: 'rebind', steps: ['Do not modify this folder. Ask the user for the correct checkout path, or confirm identity explicitly if this really is a fork (update_project_location confirm_identity).'] };
     case 'conflicts_present': return { kind: 'manual', steps: ['Resolve merge conflicts with the user. Never reset, clean, or checkout --force automatically.'] };
     case 'destination_dirty': return { kind: 'preserve_work', steps: [`Show the user the uncommitted destination changes: git -C ${posixQuote(root)} status / diff.`, 'Options: commit/push it from there, copy it aside, or choose another worktree. Never stash/reset/clean silently.'] };
@@ -825,8 +864,11 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
         `To keep working from the destination as it is, re-run preflight with basis:"destination": it checks that checkout and records the commit you run.`,
         `To sync instead, bring those commits to the source first: on the destination 'git bundle create ahead.bundle ${s}..HEAD', copy it to the source, 'git fetch ahead.bundle HEAD' and merge there. Never overwrite them.`] };
     }
-    case 'branch_mismatch': return { kind: 'choose_checkout', steps: ['Prefer another existing checkout/worktree on the right branch, or (if destination is clean and the user agrees) git switch <branch> there. Do not force a branch to match names.'] };
-    case 'revision_mismatch': steps.push(
+    case 'branch_mismatch': return bothGit
+      ? gitPlan('switch', src, root, dst, diff)
+      : { kind: 'choose_checkout', steps: ['Prefer another existing checkout/worktree on the right branch, or (if destination is clean and the user agrees) git switch <branch> there. Do not force a branch to match names.'] };
+    case 'revision_mismatch': if (bothGit) return gitPlan('fast_forward', src, root, dst, diff);
+      steps.push(
       `Move commits without a cloud remote: on source 'git bundle create sync.bundle ${dst.git?.head ? `${dst.git.head.slice(0, 12)}..` : ''}${src.git?.branch ?? 'HEAD'}', scp it, then on destination 'git fetch sync.bundle ${src.git?.branch ?? 'HEAD'}' and 'git merge --ff-only FETCH_HEAD'.`,
       'If --ff-only fails the destination is ahead/diverged: stop and ask the user.');
       // falls through to content plan
@@ -892,7 +934,8 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
     toolchain: toolchain.state, device: 'not_checked', test_tool: 'not_checked' };
   const toolsOk = !wantsTools || !['missing', 'incompatible'].includes(toolchain.state);
   const plan = suggestPlan(verdict, s.inspection, d.inspection, dest, diff);
-  const side = (l: LocationRow, r: typeof s) => ({ location_id: l.id, label: l.label, host_id: l.host_id, path: r.inspection.canonical_path ?? l.path_input,
+  const full = input.detail === 'full';
+  const side = (l: LocationRow, r: typeof s) => ({ ...(full ? { location_id: l.id, host_id: l.host_id } : {}), label: l.label, path: r.inspection.canonical_path ?? l.path_input,
     branch: r.inspection.git?.branch ?? null, head: r.inspection.git?.head?.slice(0, 12) ?? null,
     uncommitted: r.inspection.git?.is_repo ? r.inspection.git.staged + r.inspection.git.unstaged + r.inspection.git.untracked : null });
 
@@ -909,20 +952,21 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
     ? `Run from ${d.inspection.canonical_path} at ${execution.commit?.slice(0, 12) ?? 'its current state'} without transferring files (sync verdict is ${verdict}).`
     : runVerdict === 'ready' && !toolsOk ? `Toolchain ${toolchain.state}: ${toolchain.facts[0]?.detail ?? toolchain.state}` : plan.steps[0];
   const t = now();
-  // summary: counts plus a few paths per fact; detail:"full" keeps every list and the raw inspections
-  const compact = (f: Fact) => (input.detail === 'full' || !f.paths || f.paths.length <= 5 ? f : { ...f, paths: f.paths.slice(0, 5), paths_total: f.paths.length });
+  // summary: counts plus a few paths per blocking fact; detail:"full" keeps every list, ids and the raw inspections.
+  // Everything static (what verdict/execution/readiness mean) lives in the tool description, not in every response.
+  const compact = (f: Fact) => (full || !f.paths ? f : !f.blocking ? { ...f, paths: undefined }
+    : f.paths.length <= 5 ? f : { ...f, paths: f.paths.slice(0, 5), paths_total: f.paths.length });
+  const toolchainOut = full || !['not_applicable', 'not_checked'].includes(toolchain.state) ? toolchain : undefined;
   return {
     verdict, ready_for_intent: readyForIntent, intent: input.intent, execution,
-    summary: { setup: dest.label || null, source: side(src, s), destination: side(dest, d), readiness: { ...readiness, as_of: t }, files_to_copy: (plan as { copy_count?: number }).copy_count ?? 0,
+    summary: { setup: dest.label || null, source: side(src, s), destination: side(dest, d), readiness: full ? { ...readiness, as_of: t } : readiness, files_to_copy: (plan as { copy_count?: number }).copy_count ?? 0,
       since_verified_sync: diff.since_verified_sync && Object.fromEntries(Object.entries(diff.since_verified_sync).map(([k, v]) => [k, v.length])), lease, next_step: next },
     facts: facts.map(compact), source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
     generations: { source: src.location_generation, destination: dest.location_generation },
-    evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t,
+    ...(full ? { evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t } : {}),
     ready_until: readyForIntent ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
-    suggested_plan: plan, toolchain, // never shortened: its copy list is what the agent transfers
-    ...(input.detail === 'full' ? { source: summarize(s), destination: summarize(d) } : {}),
-    note: 'verdict covers syncing files from the source; execution.verdict covers the checkout you will run; ready_for_intent adds the toolchain. ' +
-      'readiness.as_of is when this evidence was read (newer than a host check shown elsewhere). device/test_tool are not_checked. detail:"full" returns every path and the raw inspections.',
+    suggested_plan: plan, toolchain: toolchainOut, // the plan is never shortened: its copy list is what the agent transfers
+    ...(full ? { source: summarize(s), destination: summarize(d) } : {}),
   };
 }
 

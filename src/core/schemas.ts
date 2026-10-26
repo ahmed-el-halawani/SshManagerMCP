@@ -1,5 +1,11 @@
 import { z } from 'zod';
 
+/**
+ * A UUID that validates like z.uuid() but, being a refinement, is not spelled out as a ~200-char regex in the MCP tool
+ * schemas (every id field of every tool, in the agent's context on each session).
+ */
+export const Uuid = z.string().refine((s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s), 'invalid UUID');
+
 // eslint-disable-next-line no-control-regex
 const noControl = (s: string) => !/[\u0000-\u001f\u007f]/.test(s);
 const token = (re: RegExp, what: string) =>
@@ -57,7 +63,7 @@ export const CapabilityInput = z.object({
 }).strict();
 
 export const ResourceInput = z.object({
-  id: z.uuid().optional(),
+  id: Uuid.optional(),
   resource_kind: z.enum(['physical_device', 'simulator', 'browser', 'other']),
   label: z.string().min(1).max(200),
   stable_external_id: z.string().max(200).nullable().optional(),
@@ -85,12 +91,12 @@ export const HostPatch = z.object({
   }).optional(),
   resources: z.object({
     upsert: z.array(ResourceInput).max(100).default([]),
-    remove: z.array(z.uuid()).max(100).default([]),
+    remove: z.array(Uuid).max(100).default([]),
   }).optional(),
 }).strict();
 
 export const UpdateHostInput = z.object({
-  host_id: z.uuid(),
+  host_id: Uuid,
   expected_revision: z.number().int().min(1),
   patch: HostPatch,
   idempotency_key: IdemKey,
@@ -107,7 +113,7 @@ export const ConsistencyPolicy = z.object({
 export type ConsistencyPolicy = z.infer<typeof ConsistencyPolicy>;
 
 export const LocationSpec = z.object({
-  host_id: z.uuid().nullable(),
+  host_id: Uuid.nullable(),
   path: z.string().min(1).max(4096).refine(noControl).nullable().optional(),
   mode: z.enum(['adopt_existing', 'create_if_missing']).default('adopt_existing'),
   label: z.string().max(200).default(''),

@@ -50,7 +50,7 @@ The MCP server gives you a **registry and verification tools only**. It does not
      - `execution.verdict` checks only that checkout.
      - `execution.commit` is what you will run; report it.
      - `ready_for_intent` follows `execution.verdict`. Do not transfer files in that case.
-5. Transfer with your terminal (scp/sftp/git bundle). Hold `ssh_projects_acquire_lease` while you transfer.
+5. Transfer with your terminal. When `suggested_plan.kind` starts with `git_`, run its steps as given (`source:` on this PC, `host:` over ssh, copy only the files in `copy`); otherwise scp/sftp the listed files. Hold `ssh_projects_acquire_lease` while you transfer.
 6. `ssh_projects_verify_sync` with the `source_snapshot` and `generations` from preflight. Your own report of "copied OK" is not evidence.
    - `partial` means some files arrived, for example after a dropped connection. Retry the copy and verify again.
    - Build only after `verified`/`ready`, and re-run preflight before the next build (readiness expires after ~60 s).

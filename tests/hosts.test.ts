@@ -165,6 +165,7 @@ test('password auth: DPAPI-encrypted at rest, askpass answers only password prom
   // the .cmd shim itself is exercised by ssh in password.e2e.test.ts
   const askpass = (prompt: string) => spawnSync(process.execPath, [join(core.dataDir, 'askpass.mjs'), prompt], { env: { ...process.env, SSHRM_HOST_ID: h.id }, encoding: 'utf8' });
   assert.equal(askpass("dev@h.lan's password: ").stdout, secret + '\n');
+  assert.equal(askpass('(dev@h.lan) Password:').status, 1, 'a second prompt for the same ssh process is refused');
   assert.equal(askpass('Enter passphrase for key id_rsa:').stdout, '');
   assert.equal(askpass('Are you sure you want to continue connecting (yes/no)?').stdout, '');
 
