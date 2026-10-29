@@ -6,7 +6,7 @@ import { openDb, now, tx } from './db.ts';
 import { AppError } from './errors.ts';
 import { switchToKeyAuth } from './keyauth.ts';
 import { sshAlias, writeSshConfig } from './sshconfig.ts';
-import { getHost, listHosts, registerHost, removeHost, updateHost, profileOf, type HostRow } from './hosts.ts';
+import { getHost, listHosts, registerHost, removeHost, updateHost, duplicateHost, profileOf, type HostRow } from './hosts.ts';
 import { parseConnectionInput, type ShellKind } from './parse.ts';
 import { executionEnvironment, resolveDataDir } from './paths.ts';
 import * as projects from './projects.ts';
@@ -48,6 +48,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     parseConnectionInput: (i: { text: string; source_shell: ShellKind }) =>
       parseConnectionInput(z.string().max(2000).parse(i.text), z.enum(['posix', 'powershell', 'cmd']).parse(i.source_shell)),
     registerHost: (i: unknown) => syncConfig(registerHost(db, s, i)),
+    duplicateHost: (i: unknown) => syncConfig(duplicateHost(db, s, i)),
     updateHost: (i: unknown) => syncConfig(updateHost(db, s, i)),
     listHosts: (i: Parameters<typeof listHosts>[1] = {}) => listHosts(db, i),
     getHost: (i: { host_id: string }) => { const id = z.uuid().parse(i.host_id); return { ...getHost(db, id), ssh_alias: sshAlias(db, dataDir, id) }; },

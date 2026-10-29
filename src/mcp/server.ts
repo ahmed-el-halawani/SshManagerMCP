@@ -73,6 +73,9 @@ tool('ssh_hosts_register', 'Register a host (saved even if offline; no network).
 tool('ssh_hosts_update', 'Patch a host. Requires expected_revision. Changing endpoint/user/alias/config invalidates previous check and trust state. capabilities/resources are typed upsert/remove patches.',
   z.object({ host_id: uuid, expected_revision: int, patch: HostPatch, idempotency_key: IdemKey }), WRITE, (i) => core.updateHost(i));
 
+tool('ssh_hosts_duplicate', 'Duplicate an existing host configuration with a new name. Copies profile, metadata, and capabilities.',
+  z.object({ host_id: uuid, new_name: z.string().optional(), copy_password: z.boolean().optional(), idempotency_key: IdemKey }), WRITE, (i) => core.duplicateHost(i));
+
 tool('ssh_hosts_list', 'List host summaries with last-known status and its age. No secrets, no long instructions.',
   z.object({ cursor: z.string().optional(), limit: z.number().int().min(1).max(100).optional(), query: z.string().max(200).optional(), tag: z.string().max(50).optional(), enabled: z.boolean().optional() }), RO, (i) => core.listHosts(i));
 

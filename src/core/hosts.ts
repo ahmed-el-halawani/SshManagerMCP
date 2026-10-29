@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { type DB, now, tx } from './db.ts';
 import { AppError, notFound } from './errors.ts';
-import { HostPatch, Profile, RegisterHostInput, UpdateHostInput, type Source } from './schemas.ts';
+import { HostPatch, IdemKey, Profile, RegisterHostInput, UpdateHostInput, type Source } from './schemas.ts';
 import { getSettings } from './settings.ts';
 
 export type HostRow = {
@@ -163,6 +163,61 @@ export function registerHost(db: DB, source: Source, raw: unknown) {
     recordIdempotency(db, input.idempotency_key, 'register_host', input, id);
     audit(db, source, 'register_host', id, null, 1, { target: targetSummary(input.profile) });
     return { host: getHost(db, id), duplicate_candidates: duplicates(db, input.profile, id), replayed: false };
+  });
+}
+
+export const DuplicateHostInput = z.object({
+  host_id: z.uuid(),
+  new_name: z.string().trim().min(1).max(200).optional(),
+  copy_password: z.boolean().default(true),
+  idempotency_key: IdemKey,
+}).strict();
+
+export function duplicateHost(db: DB, source: Source, raw: unknown) {
+  const input = DuplicateHostInput.parse(raw);
+  return tx(db, () => {
+    const prev = checkIdempotency(db, input.idempotency_key, 'duplicate_host', input);
+    if (prev) return { host: getHost(db, prev), replayed: true };
+    const origRow = getHostRow(db, input.host_id);
+    const origFull = getHost(db, input.host_id);
+    const id = randomUUID();
+    const t = now();
+    const newName = input.new_name || `${origRow.name} (Copy)`;
+
+    db.prepare(`INSERT INTO hosts(id, name, enabled, connection_mode, connection_profile_json, declared_os, description, instructions, tags_json, default_remote_directory, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        id,
+        newName,
+        origRow.enabled,
+        origRow.connection_mode,
+        origRow.connection_profile_json,
+        origRow.declared_os,
+        origRow.description,
+        origRow.instructions,
+        origRow.tags_json,
+        origRow.default_remote_directory,
+        t,
+        t
+      );
+
+    upsertCapabilities(db, id, origFull.capabilities.map((c: any) => ({
+      key: c.key,
+      label: c.label,
+      declared_description: c.declared_description,
+      enabled: c.enabled,
+    })), source === 'mcp' ? 'agent' : 'user');
+
+    if (input.copy_password) {
+      const secret = db.prepare("SELECT secret_blob FROM host_secrets WHERE host_id=? AND kind='password'").get(input.host_id) as { secret_blob: string } | undefined;
+      if (secret) {
+        db.prepare("INSERT INTO host_secrets(host_id, kind, secret_blob, updated_at) VALUES(?, 'password', ?, ?)").run(id, secret.secret_blob, t);
+        db.prepare("INSERT INTO audit_events(timestamp, source, action, host_id, details_json) VALUES(?, 'gui', 'set_secret:password', ?, '{}')").run(t, id);
+      }
+    }
+
+    recordIdempotency(db, input.idempotency_key, 'duplicate_host', input, id);
+    audit(db, source, 'duplicate_host', id, null, 1, { original_host_id: input.host_id, name: newName });
+    return { host: getHost(db, id), replayed: false };
   });
 }
 

@@ -76,7 +76,7 @@ export function App() {
       <div className="content-area">
         {tab === 'hosts' && editing && <HostForm hostId={editing === 'new' ? null : editing} onDone={(id) => { setEditing(null); if (id) setHostId(id); }} />}
         {tab === 'hosts' && !editing && hostId && <HostDetail id={hostId} onBack={() => setHostId(null)} onEdit={() => setEditing(hostId)} />}
-        {tab === 'hosts' && !editing && !hostId && <HostList onOpen={setHostId} onAdd={() => setEditing('new')} />}
+        {tab === 'hosts' && !editing && !hostId && <HostList onOpen={setHostId} onAdd={() => setEditing('new')} onEdit={(id) => setEditing(id)} />}
         {tab === 'setup' && <Setup />}
       </div>
     </div>
@@ -87,11 +87,24 @@ export function App() {
 // Hosts List
 // ═══════════════════════════════════════════════════════════
 
-function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () => void }) {
+function HostList({ onOpen, onAdd, onEdit }: { onOpen: (id: string) => void; onAdd: () => void; onEdit: (id: string) => void }) {
   const [query, setQuery] = useState('');
-  const { data, error } = usePoll(() => call<{ hosts: HostSummary[] }>('listHosts', { query: query || undefined, limit: 100 }), [query]);
+  const { data, error, reload } = usePoll(() => call<{ hosts: HostSummary[] }>('listHosts', { query: query || undefined, limit: 100 }), [query]);
   const settings = usePoll(() => call<{ gui_auto_check: boolean }>('getSettings'), [], 10_000).data;
   const running = useRef(new Set<string>());
+
+  // Context menu & action states
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; host: HostSummary } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<HostSummary | null>(null);
+  const [renameInput, setRenameInput] = useState('');
+  const [dupTarget, setDupTarget] = useState<HostSummary | null>(null);
+  const [dupInput, setDupInput] = useState('');
+  const [dupCopyPassword, setDupCopyPassword] = useState(true);
+  const [deleteTarget, setDeleteTarget] = useState<HostSummary | null>(null);
+  const [actionErr, setActionErr] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [actionBusy, setActionBusy] = useState(false);
+
   useEffect(() => {
     if (!settings?.gui_auto_check || !data) return;
     const t = setInterval(() => {
@@ -103,6 +116,101 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
     }, 60_000);
     return () => clearInterval(t);
   }, [settings?.gui_auto_check, data]);
+
+  // Click outside / keydown to dismiss context menu & dialogs
+  useEffect(() => {
+    const handleGlobalClick = () => setContextMenu(null);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setContextMenu(null);
+        setRenameTarget(null);
+        setDupTarget(null);
+        setDeleteTarget(null);
+      }
+    };
+    window.addEventListener('click', handleGlobalClick);
+    window.addEventListener('contextmenu', handleGlobalClick);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('click', handleGlobalClick);
+      window.removeEventListener('contextmenu', handleGlobalClick);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
+
+  const openContextMenu = (e: React.MouseEvent, h: HostSummary) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const menuWidth = 200;
+    const menuHeight = 180;
+    const x = e.clientX + menuWidth > window.innerWidth ? window.innerWidth - menuWidth - 10 : e.clientX;
+    const y = e.clientY + menuHeight > window.innerHeight ? window.innerHeight - menuHeight - 10 : e.clientY;
+    setContextMenu({ x, y, host: h });
+  };
+
+  const handleRename = async () => {
+    if (!renameTarget || !renameInput.trim()) return;
+    setActionBusy(true);
+    setActionErr(null);
+    try {
+      await call('updateHost', {
+        host_id: renameTarget.id,
+        expected_revision: renameTarget.revision,
+        patch: { metadata: { name: renameInput.trim() } },
+        idempotency_key: idem(),
+      });
+      setActionSuccess(`Host renamed to "${renameInput.trim()}"`);
+      setTimeout(() => setActionSuccess(null), 3000);
+      setRenameTarget(null);
+      reload();
+    } catch (e) {
+      setActionErr(errText(e));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleDuplicate = async () => {
+    if (!dupTarget || !dupInput.trim()) return;
+    setActionBusy(true);
+    setActionErr(null);
+    try {
+      await call('duplicateHost', {
+        host_id: dupTarget.id,
+        new_name: dupInput.trim(),
+        copy_password: dupCopyPassword,
+        idempotency_key: idem(),
+      });
+      setActionSuccess(`Host "${dupInput.trim()}" successfully duplicated!`);
+      setTimeout(() => setActionSuccess(null), 4000);
+      setDupTarget(null);
+      reload();
+    } catch (e) {
+      setActionErr(errText(e));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    setActionBusy(true);
+    setActionErr(null);
+    try {
+      await call('removeHost', {
+        host_id: deleteTarget.id,
+        expected_revision: deleteTarget.revision,
+      });
+      setActionSuccess(`Host "${deleteTarget.name}" deleted.`);
+      setTimeout(() => setActionSuccess(null), 3000);
+      setDeleteTarget(null);
+      reload();
+    } catch (e) {
+      setActionErr(errText(e));
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   const onlineCount = data?.hosts.filter(h => h.status.state === 'reachable').length ?? 0;
   const offlineCount = data?.hosts.filter(h => h.status.state === 'unreachable' || h.status.state === 'error').length ?? 0;
@@ -138,7 +246,9 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
         </div>
       )}
 
-      <Err e={error} />
+      <Err e={actionErr || error} />
+      {actionSuccess && <div className="success">✓ {actionSuccess}</div>}
+
       {!data && !error && <p className="muted">Loading…</p>}
       {data && data.hosts.length === 0 && (
         <div className="empty-state">
@@ -150,10 +260,25 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
       )}
       {data && data.hosts.length > 0 && (
         <table className="host-table">
-          <thead><tr><th>Host</th><th>OS</th><th>Target</th><th>Status</th><th>Capabilities</th></tr></thead>
+          <thead>
+            <tr>
+              <th>Host</th>
+              <th>OS</th>
+              <th>Target</th>
+              <th>Status</th>
+              <th>Capabilities</th>
+              <th style={{ width: 44, textAlign: 'center' }}></th>
+            </tr>
+          </thead>
           <tbody>
             {data.hosts.map((h) => (
-              <tr key={h.id} onClick={() => onOpen(h.id)} className={`click ${h.enabled ? '' : 'dim'}`}>
+              <tr
+                key={h.id}
+                onClick={() => onOpen(h.id)}
+                onContextMenu={(e) => openContextMenu(e, h)}
+                className={`click ${h.enabled ? '' : 'dim'}`}
+                title="Click to view details · Right-click for options"
+              >
                 <td>
                   <span className="host-name">{h.name}</span>
                   <div className="id">{h.id.slice(0, 8)}</div>
@@ -162,10 +287,179 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
                 <td className="mono">{h.target}</td>
                 <td><Badge s={h.status} /></td>
                 <td>{h.capability_keys.slice(0, 4).join(', ')}{h.capability_keys.length > 4 ? ` +${h.capability_keys.length - 4}` : ''}</td>
+                <td style={{ textAlign: 'center' }} onClick={(e) => e.stopPropagation()}>
+                  <button
+                    className="ghost"
+                    style={{ padding: '2px 8px', fontSize: '16px', lineHeight: 1 }}
+                    title="Options (Right-click)"
+                    onClick={(e) => openContextMenu(e, h)}
+                  >
+                    ⋮
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+      )}
+
+      {/* ── Context Menu ────────────────────────────────────────── */}
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="context-menu-header mono small">
+            {contextMenu.host.name}
+          </div>
+          <button
+            className="context-menu-item"
+            onClick={() => {
+              const h = contextMenu.host;
+              setContextMenu(null);
+              onEdit(h.id);
+            }}
+          >
+            <span className="menu-icon">✏️</span>
+            <span>Edit Host</span>
+          </button>
+          <button
+            className="context-menu-item"
+            onClick={() => {
+              const h = contextMenu.host;
+              setContextMenu(null);
+              setRenameTarget(h);
+              setRenameInput(h.name);
+            }}
+          >
+            <span className="menu-icon">🏷️</span>
+            <span>Rename…</span>
+          </button>
+          <button
+            className="context-menu-item highlight"
+            onClick={() => {
+              const h = contextMenu.host;
+              setContextMenu(null);
+              setDupTarget(h);
+              setDupInput(`${h.name} (Copy)`);
+              setDupCopyPassword(true);
+            }}
+          >
+            <span className="menu-icon">📋</span>
+            <span>Duplicate Host…</span>
+            <span className="badge-new">New</span>
+          </button>
+          <div className="context-menu-sep" />
+          <button
+            className="context-menu-item danger"
+            onClick={() => {
+              const h = contextMenu.host;
+              setContextMenu(null);
+              setDeleteTarget(h);
+            }}
+          >
+            <span className="menu-icon">🗑️</span>
+            <span>Delete Host…</span>
+          </button>
+        </div>
+      )}
+
+      {/* ── Rename Modal ────────────────────────────────────────── */}
+      {renameTarget && (
+        <div className="modal-back" onClick={() => !actionBusy && setRenameTarget(null)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="row">
+              <h3>Rename Host</h3>
+              <span className="grow" />
+              <button className="ghost" disabled={actionBusy} onClick={() => setRenameTarget(null)}>✕</button>
+            </div>
+            <p className="muted small">Change display name for <b className="mono">{renameTarget.target}</b></p>
+            <div className="field" style={{ marginTop: 12 }}>
+              <span>Host Display Name</span>
+              <input
+                autoFocus
+                value={renameInput}
+                onChange={(e) => setRenameInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleRename(); }}
+              />
+            </div>
+            <div className="row" style={{ marginTop: 16, justifyContent: 'flex-end' }}>
+              <button disabled={actionBusy} onClick={() => setRenameTarget(null)}>Cancel</button>
+              <button className="primary" disabled={actionBusy || !renameInput.trim() || renameInput.trim() === renameTarget.name} onClick={handleRename}>
+                {actionBusy ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Duplicate Modal ────────────────────────────────────────── */}
+      {dupTarget && (
+        <div className="modal-back" onClick={() => !actionBusy && setDupTarget(null)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="row">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 18 }}>📋</span>
+                <h3>Duplicate Host</h3>
+              </div>
+              <span className="grow" />
+              <button className="ghost" disabled={actionBusy} onClick={() => setDupTarget(null)}>✕</button>
+            </div>
+            <p className="muted small">
+              Clone <b>{dupTarget.name}</b> (<span className="mono">{dupTarget.target}</span>). Profile, connection options, OS settings, and capabilities will be copied into a new host.
+            </p>
+            <div className="field" style={{ marginTop: 12 }}>
+              <span>New Host Name</span>
+              <input
+                autoFocus
+                value={dupInput}
+                onChange={(e) => setDupInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleDuplicate(); }}
+                placeholder="e.g. My Host (Copy)"
+              />
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={dupCopyPassword}
+                onChange={(e) => setDupCopyPassword(e.target.checked)}
+              />
+              <span className="small">Copy stored credentials (passwords will be securely encrypted for new host)</span>
+            </label>
+            <div className="row" style={{ marginTop: 18, justifyContent: 'flex-end' }}>
+              <button disabled={actionBusy} onClick={() => setDupTarget(null)}>Cancel</button>
+              <button className="primary" disabled={actionBusy || !dupInput.trim()} onClick={handleDuplicate}>
+                {actionBusy ? 'Duplicating…' : 'Duplicate Host'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete Modal ────────────────────────────────────────── */}
+      {deleteTarget && (
+        <div className="modal-back" onClick={() => !actionBusy && setDeleteTarget(null)}>
+          <div className="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="row">
+              <h3 style={{ color: 'var(--bad)' }}>Delete Host</h3>
+              <span className="grow" />
+              <button className="ghost" disabled={actionBusy} onClick={() => setDeleteTarget(null)}>✕</button>
+            </div>
+            <p style={{ marginTop: 8 }}>
+              Are you sure you want to delete <b>{deleteTarget.name}</b> (<span className="mono">{deleteTarget.target}</span>)?
+            </p>
+            <p className="muted small" style={{ marginTop: 6 }}>
+              Only the local registry record is deleted. Remote machines, SSH keys, and config files will not be touched.
+            </p>
+            <div className="row" style={{ marginTop: 18, justifyContent: 'flex-end' }}>
+              <button disabled={actionBusy} onClick={() => setDeleteTarget(null)}>Cancel</button>
+              <button className="danger" disabled={actionBusy} onClick={handleDelete}>
+                {actionBusy ? 'Deleting…' : 'Delete Host'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </section>
   );

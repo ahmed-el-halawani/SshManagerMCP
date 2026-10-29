@@ -259,3 +259,32 @@ test('switch to key auth: installs the key with the stored password, keeps trust
     for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
   }
 });
+
+
+test('duplicate host: copies profile, metadata, capabilities and password', () => {
+  const core = makeCore('gui');
+  const h = core.registerHost({
+    profile: { mode: 'direct', hostname: 'prod.server', port: 22, username: 'admin', auth: 'password' },
+    metadata: { name: 'Production Server', declared_os: 'linux', description: 'Main server', instructions: 'handle carefully' },
+    capabilities: [{ key: 'binary.docker', label: 'Docker' }],
+    idempotency_key: key(),
+  }).host;
+  core.setHostPassword({ host_id: h.id, password: 'secret-password' });
+
+  // duplicate with default (Copy) name
+  const dup1 = core.duplicateHost({ host_id: h.id, idempotency_key: key() }).host;
+  assert.equal(dup1.name, 'Production Server (Copy)');
+  assert.notEqual(dup1.id, h.id);
+  assert.equal(dup1.profile.hostname, 'prod.server');
+  assert.equal(dup1.declared_os, 'linux');
+  assert.equal(dup1.description, 'Main server');
+  assert.equal(dup1.instructions, 'handle carefully');
+  assert.equal(dup1.capabilities.length, 1);
+  assert.equal(dup1.capabilities[0].key, 'binary.docker');
+  assert.equal(dup1.password_stored, true, 'password was duplicated');
+
+  // duplicate with custom name and without password
+  const dup2 = core.duplicateHost({ host_id: h.id, new_name: 'Staging Server', copy_password: false, idempotency_key: key() }).host;
+  assert.equal(dup2.name, 'Staging Server');
+  assert.equal(dup2.password_stored, false, 'password was excluded');
+});

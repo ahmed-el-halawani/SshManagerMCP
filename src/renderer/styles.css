@@ -487,10 +487,98 @@ pre {
   padding: 16px 20px;
   box-shadow: 0 20px 60px rgba(0,0,0,.5);
 }
+.modal.modal-sm {
+  width: min(440px, 92vw);
+}
 .picker-list { overflow: auto; flex: 1; min-height: 200px; border: 1px solid var(--line); border-radius: var(--radius); padding: 4px; background: var(--bg); }
 .picker-item { padding: 6px 10px; border-radius: 6px; cursor: pointer; user-select: none; transition: background 0.1s; }
 .picker-item:hover { background: var(--accent-soft); }
 .picker-item.dim { opacity: .5; }
+
+/* ── context menu ─────────────────────────────────────────── */
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 6px;
+  min-width: 190px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: contextFadeIn 0.12s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes contextFadeIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+.context-menu-header {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.12s;
+  width: 100%;
+}
+.context-menu-item:hover {
+  background: var(--panel-hover);
+  color: #fff;
+}
+.context-menu-item.highlight:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.context-menu-item .menu-icon {
+  font-size: 15px;
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.context-menu-item.danger {
+  color: var(--bad);
+}
+.context-menu-item.danger:hover {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+.context-menu-item .badge-new {
+  margin-left: auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.context-menu-sep {
+  height: 1px;
+  background: var(--line);
+  margin: 4px 6px;
+}
 
 /* ── quick bind section ───────────────────────────────────── */
 .quick-bind-grid {
