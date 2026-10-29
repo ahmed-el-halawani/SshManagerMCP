@@ -15,6 +15,7 @@ declare global {
       importApply: () => Promise<Envelope<unknown>>;
       backup: () => Promise<string | null>;
       openDataDir: () => Promise<string>;
+      copyText: (text: string) => Promise<boolean>;
     };
   }
 }
@@ -31,6 +32,30 @@ export async function call<T = any>(method: string, arg?: unknown): Promise<T> {
 }
 
 export const idem = () => `gui-${crypto.randomUUID()}`;
+
+export async function copy(t: string): Promise<void> {
+  if (window.api && typeof window.api.copyText === 'function') {
+    await window.api.copyText(t);
+    return;
+  }
+  if (navigator?.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(t);
+      return;
+    } catch {
+      // fallback to execCommand below
+    }
+  }
+  const el = document.createElement('textarea');
+  el.value = t;
+  el.setAttribute('readonly', '');
+  el.style.position = 'fixed';
+  el.style.opacity = '0';
+  document.body.appendChild(el);
+  el.select();
+  document.execCommand('copy');
+  document.body.removeChild(el);
+}
 
 /**
  * Every GUI check goes through here. After the first successful check of a password host (the password works and the

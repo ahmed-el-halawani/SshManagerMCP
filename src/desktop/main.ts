@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -79,6 +79,11 @@ ipcMain.handle('backup', async () => {
 
 ipcMain.handle('open-data-dir', () => shell.openPath(core.dataDir));
 
+ipcMain.handle('copy-text', (_e, text: string) => {
+  clipboard.writeText(String(text ?? ''));
+  return true;
+});
+
 // ---- start with Windows: the OS login item is the source of truth; packaged builds only (dev would register electron.exe)
 const loginItem = () => ({ supported: app.isPackaged, enabled: app.isPackaged && app.getLoginItemSettings({ args: [BACKGROUND] }).openAtLogin });
 // The user's choice is kept in the data dir and re-applied on every start, so the entry follows the exe that
@@ -148,7 +153,12 @@ app.whenReady().then(async () => {
   session.defaultSession.webRequest.onHeadersReceived((d, cb) => cb({
     responseHeaders: { ...d.responseHeaders, 'Content-Security-Policy': ["default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'"] },
   }));
-  session.defaultSession.setPermissionRequestHandler((_wc, _p, cb) => cb(false));
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => {
+    if (permission === 'clipboard-sanitized-write' || permission === 'clipboard-read') {
+      return cb(true);
+    }
+    cb(false);
+  });
   tray = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16, quality: 'best' }));
   tray.setToolTip('SSH Resource Manager');
   tray.on('click', showWindow);

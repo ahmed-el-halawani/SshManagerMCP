@@ -13,4 +13,5 @@ contextBridge.exposeInMainWorld('api', {
   importApply: () => ipcRenderer.invoke('import-apply'),
   backup: () => ipcRenderer.invoke('backup'),
   openDataDir: () => ipcRenderer.invoke('open-data-dir'),
+  copyText: (text: string) => ipcRenderer.invoke('copy-text', text),
 });

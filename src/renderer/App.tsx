@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { age, call, CallError, checkHost, errText, idem } from './api.ts';
+import { age, call, CallError, checkHost, copy, errText, idem } from './api.ts';
 
 type Status = { state: string; checked_at: string | null; stale: boolean; error_code: string | null };
 type HostSummary = { id: string; name: string; enabled: boolean; target: string; declared_os: string; observed_os: string | null; os_mismatch: boolean; tags: string[]; revision: number; status: Status; capability_keys: string[] };
@@ -15,38 +15,77 @@ function usePoll<T>(fn: () => Promise<T>, deps: unknown[], ms = 2000) {
   return { data, error, reload: tick };
 }
 
+const StatusDot = ({ s }: { s: Status }) => {
+  const cls = s.state === 'reachable' ? 'dot-ok' : ['unreachable', 'error', 'host_key_changed'].includes(s.state) ? 'dot-bad' : s.state === 'unknown' ? 'dot-muted' : 'dot-warn';
+  return <span className={`badge-dot ${cls}`} title={s.state.replace('_', ' ')} />;
+};
+
 const Badge = ({ s }: { s: Status }) => (
   <span className={`badge st-${s.state}`} title={s.error_code ?? ''}>
+    <StatusDot s={s} />
     {s.state.replace('_', ' ')}{s.checked_at ? ` · ${age(s.checked_at)}` : ''}{s.stale && s.checked_at ? ' · stale' : ''}
   </span>
 );
 
 const Err = ({ e }: { e: string | null }) => (e ? <div className="error">{e}</div> : null);
-const copy = (t: string) => navigator.clipboard.writeText(t);
+
+// ═══════════════════════════════════════════════════════════
+// Root App
+// ═══════════════════════════════════════════════════════════
 
 export function App() {
   const [tab, setTab] = useState<'hosts' | 'setup'>('hosts');
   const [hostId, setHostId] = useState<string | null>(null);
   const [editing, setEditing] = useState<'new' | string | null>(null);
+  const { data: hostsData } = usePoll(() => call<{ hosts: HostSummary[] }>('listHosts', { limit: 100 }), [], 3000);
+
+  const hostCount = hostsData?.hosts.length ?? 0;
+  const onlineCount = hostsData?.hosts.filter(h => h.status.state === 'reachable').length ?? 0;
+
   return (
     <div className="app">
-      <nav>
-        <b>SSH Resource Manager</b>
-        {(['hosts', 'setup'] as const).map((t) => (
-          <button key={t} className={tab === t ? 'active' : ''} onClick={() => { setTab(t); setHostId(null); setEditing(null); }}>{t[0].toUpperCase() + t.slice(1)}</button>
-        ))}
-      </nav>
-      <main>
+      {/* ── Sidebar ─────────────────────────────────────────── */}
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <div className="brand-icon">⌘</div>
+          <div>
+            <div className="brand-text">SSH Manager</div>
+            <div className="brand-sub">Resource Control</div>
+          </div>
+        </div>
+
+        <nav className="sidebar-nav">
+          <button className={tab === 'hosts' ? 'active' : ''} onClick={() => { setTab('hosts'); setHostId(null); setEditing(null); }}>
+            <span className="nav-icon">🖥</span>
+            Hosts
+            {hostCount > 0 && <span className="nav-count">{hostCount}</span>}
+          </button>
+          <button className={tab === 'setup' ? 'active' : ''} onClick={() => { setTab('setup'); setHostId(null); setEditing(null); }}>
+            <span className="nav-icon">⚙</span>
+            Setup
+          </button>
+        </nav>
+
+        <div className="sidebar-footer">
+          <div className="version">SSH Resource Manager v1.0</div>
+          <div className="version">{onlineCount}/{hostCount} hosts online</div>
+        </div>
+      </aside>
+
+      {/* ── Content ────────────────────────────────────────── */}
+      <div className="content-area">
         {tab === 'hosts' && editing && <HostForm hostId={editing === 'new' ? null : editing} onDone={(id) => { setEditing(null); if (id) setHostId(id); }} />}
         {tab === 'hosts' && !editing && hostId && <HostDetail id={hostId} onBack={() => setHostId(null)} onEdit={() => setEditing(hostId)} />}
         {tab === 'hosts' && !editing && !hostId && <HostList onOpen={setHostId} onAdd={() => setEditing('new')} />}
         {tab === 'setup' && <Setup />}
-      </main>
+      </div>
     </div>
   );
 }
 
-// ---------------- hosts ----------------
+// ═══════════════════════════════════════════════════════════
+// Hosts List
+// ═══════════════════════════════════════════════════════════
 
 function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () => void }) {
   const [query, setQuery] = useState('');
@@ -64,23 +103,61 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
     }, 60_000);
     return () => clearInterval(t);
   }, [settings?.gui_auto_check, data]);
+
+  const onlineCount = data?.hosts.filter(h => h.status.state === 'reachable').length ?? 0;
+  const offlineCount = data?.hosts.filter(h => h.status.state === 'unreachable' || h.status.state === 'error').length ?? 0;
+  const pendingCount = data?.hosts.filter(h => !['reachable', 'unreachable', 'error'].includes(h.status.state)).length ?? 0;
+
   return (
     <section>
-      <div className="row">
+      <div className="page-header">
         <h2>Hosts</h2>
-        <input placeholder="Search name, target, description" value={query} onChange={(e) => setQuery(e.target.value)} />
-        <button className="primary" onClick={onAdd}>Add host</button>
+        <div className="spacer" />
+        <input className="search-input" placeholder="Search name, target, or description…" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <button className="primary" onClick={onAdd}>+ Add Host</button>
       </div>
+
+      {data && data.hosts.length > 0 && (
+        <div className="stat-cards">
+          <div className="stat-card ok">
+            <div className="stat-value">{onlineCount}</div>
+            <div className="stat-label">Online</div>
+          </div>
+          <div className="stat-card bad">
+            <div className="stat-value">{offlineCount}</div>
+            <div className="stat-label">Offline / Error</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{pendingCount}</div>
+            <div className="stat-label">Pending / Unknown</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{data.hosts.length}</div>
+            <div className="stat-label">Total Hosts</div>
+          </div>
+        </div>
+      )}
+
       <Err e={error} />
       {!data && !error && <p className="muted">Loading…</p>}
-      {data && data.hosts.length === 0 && <p className="muted">No hosts yet. Add one here, or ask your AI agent to register it through MCP.</p>}
+      {data && data.hosts.length === 0 && (
+        <div className="empty-state">
+          <div className="empty-icon">🖥️</div>
+          <p><b>No hosts registered yet</b></p>
+          <p>Add one here, or ask your AI agent to register it through MCP.</p>
+          <button className="primary" onClick={onAdd} style={{ marginTop: 12 }}>+ Add Your First Host</button>
+        </div>
+      )}
       {data && data.hosts.length > 0 && (
-        <table>
-          <thead><tr><th>Name</th><th>OS (declared / observed)</th><th>Target</th><th>Status</th><th>Capabilities</th></tr></thead>
+        <table className="host-table">
+          <thead><tr><th>Host</th><th>OS</th><th>Target</th><th>Status</th><th>Capabilities</th></tr></thead>
           <tbody>
             {data.hosts.map((h) => (
               <tr key={h.id} onClick={() => onOpen(h.id)} className={`click ${h.enabled ? '' : 'dim'}`}>
-                <td>{h.name}<div className="id">{h.id.slice(0, 8)}</div></td>
+                <td>
+                  <span className="host-name">{h.name}</span>
+                  <div className="id">{h.id.slice(0, 8)}</div>
+                </td>
                 <td>{h.declared_os} / {h.observed_os ?? '—'} {h.os_mismatch && <span className="badge warn">mismatch</span>}</td>
                 <td className="mono">{h.target}</td>
                 <td><Badge s={h.status} /></td>
@@ -93,6 +170,10 @@ function HostList({ onOpen, onAdd }: { onOpen: (id: string) => void; onAdd: () =
     </section>
   );
 }
+
+// ═══════════════════════════════════════════════════════════
+// Host Form
+// ═══════════════════════════════════════════════════════════
 
 type FormState = {
   mode: 'direct' | 'ssh_alias'; auth: 'key' | 'password'; password: string; hostname: string; port: string; username: string; identity_file: string; identities_only: boolean; proxy_jump: string;
@@ -176,12 +257,16 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
 
   return (
     <section className="form">
-      <div className="row"><h2>{hostId ? 'Edit host' : 'Add host'}</h2><button onClick={() => onDone(hostId)}>Cancel</button></div>
+      <div className="page-header">
+        <button className="ghost" onClick={() => onDone(hostId)}>← Back</button>
+        <h2>{hostId ? 'Edit Host' : 'Add Host'}</h2>
+      </div>
       {conflict && <div className="error">This host was changed elsewhere (GUI or agent). Your edits were not saved. <button onClick={() => load()}>Reload latest</button></div>}
       <Err e={err} />
       {!hostId && (
         <fieldset>
-          <legend>Import from an ssh command (no network, nothing is executed)</legend>
+          <legend>Import from SSH command</legend>
+          <p className="muted small" style={{ marginBottom: 8 }}>Paste an ssh command to auto-fill fields. Pure parsing — no network, nothing is executed.</p>
           <div className="row">
             <input className="grow mono" placeholder='ssh -p 2222 -i "C:\keys\id_ed25519" dev@192.168.1.20' value={imp.text} onChange={(e) => setImp({ ...imp, text: e.target.value })} />
             <select value={imp.shell} onChange={(e) => setImp({ ...imp, shell: e.target.value })}><option>powershell</option><option>cmd</option><option>posix</option></select>
@@ -199,39 +284,41 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
       )}
       <fieldset>
         <legend>Connection</legend>
-        <label><input type="radio" checked={f.mode === 'direct'} onChange={() => setF({ ...f, mode: 'direct' })} /> Direct</label>
-        <label><input type="radio" checked={f.mode === 'ssh_alias'} onChange={() => setF({ ...f, mode: 'ssh_alias' })} /> Existing ssh_config alias</label>
+        <div className="row">
+          <label><input type="radio" checked={f.mode === 'direct'} onChange={() => setF({ ...f, mode: 'direct' })} /> Direct</label>
+          <label><input type="radio" checked={f.mode === 'ssh_alias'} onChange={() => setF({ ...f, mode: 'ssh_alias' })} /> Existing ssh_config alias</label>
+        </div>
         {f.mode === 'direct' ? (
           <div className="grid">
             <L t="Hostname / IP"><input value={f.hostname} onChange={set('hostname')} /></L>
             <L t="Port"><input value={f.port} onChange={set('port')} inputMode="numeric" /></L>
             <L t="Username"><input value={f.username} onChange={set('username')} /></L>
-            <L t="Identity file (local path reference, optional)"><input value={f.identity_file} onChange={set('identity_file')} /></L>
+            <L t="Identity file (optional)"><input value={f.identity_file} onChange={set('identity_file')} /></L>
             <L t="ProxyJump aliases (comma separated)"><input value={f.proxy_jump} onChange={set('proxy_jump')} /></L>
             <L t="ssh config path (optional)"><input value={f.config_path} onChange={set('config_path')} /></L>
             <label><input type="checkbox" checked={f.identities_only} onChange={set('identities_only')} /> IdentitiesOnly</label>
           </div>
         ) : (
           <div className="grid">
-            <L t="Alias (literal Host from your ssh config)"><input value={f.alias} onChange={set('alias')} /></L>
+            <L t="Alias (Host from your ssh config)"><input value={f.alias} onChange={set('alias')} /></L>
             <L t="ssh config path (optional)"><input value={f.config_path} onChange={set('config_path')} /></L>
-            <p className="muted">Aliases use your own ssh_config and known_hosts. This app never edits them.</p>
+            <p className="muted small">Aliases use your own ssh_config and known_hosts. This app never edits them.</p>
           </div>
         )}
-        <div className="row">
-          <span>Authentication:</span>
+        <div className="row" style={{ marginTop: 10 }}>
+          <span style={{ fontWeight: 500 }}>Authentication:</span>
           <label><input type="radio" checked={f.auth === 'key'} onChange={() => setF({ ...f, auth: 'key' })} /> SSH key / ssh-agent</label>
           <label><input type="radio" checked={f.auth === 'password'} onChange={() => setF({ ...f, auth: 'password' })} /> Username + password</label>
         </div>
         {f.auth === 'password' ? (
           <div className="grid">
-            <L t={stored ? 'Password (stored — leave empty to keep it)' : 'Password'}>
+            <L t={stored ? 'Password (stored — leave empty to keep)' : 'Password'}>
               <input type="password" autoComplete="new-password" value={f.password} onChange={set('password')} placeholder={stored ? '••••••••' : ''} />
             </L>
-            <p className="muted">Encrypted with Windows DPAPI for your Windows account. It is never shown again, never sent to AI agents, and is deleted automatically if the host address/user changes.
-              {stored && hostId && <> <button onClick={async () => { await call('clearHostPassword', { host_id: hostId }); setStored(false); }}>Forget stored password</button></>}</p>
+            <p className="muted small">Encrypted with Windows DPAPI. Never shown again, never sent to AI agents, and deleted automatically if the host address/user changes.
+              {stored && hostId && <> <button className="link" onClick={async () => { await call('clearHostPassword', { host_id: hostId }); setStored(false); }}>Forget stored password</button></>}</p>
           </div>
-        ) : <p className="muted">Uses keys loaded in ssh-agent or the identity file above. Private keys and passphrases are never stored.</p>}
+        ) : <p className="muted small">Uses keys loaded in ssh-agent or the identity file above. Private keys and passphrases are never stored.</p>}
       </fieldset>
       <fieldset>
         <legend>Description</legend>
@@ -239,21 +326,25 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
           <L t="Display name"><input value={f.name} onChange={set('name')} /></L>
           <L t="Declared OS"><select value={f.declared_os} onChange={set('declared_os')}>{['unknown', 'macos', 'linux', 'windows'].map((o) => <option key={o}>{o}</option>)}</select></L>
           <L t="Tags (comma separated)"><input value={f.tags} onChange={set('tags')} /></L>
-          <L t="Default remote directory (suggestion only)"><input value={f.default_remote_directory} onChange={set('default_remote_directory')} /></L>
+          <L t="Default remote directory"><input value={f.default_remote_directory} onChange={set('default_remote_directory')} /></L>
           <label><input type="checkbox" checked={f.enabled} onChange={set('enabled')} /> Enabled</label>
         </div>
         <L t="Description"><textarea value={f.description} onChange={set('description')} rows={2} /></L>
         <L t="Instructions for agents"><textarea value={f.instructions} onChange={set('instructions')} rows={3} /></L>
-        <L t="Declared capabilities — one per line: key | label (e.g. macos.xcode | Xcode 16)"><textarea className="mono" value={f.caps} onChange={set('caps')} rows={3} /></L>
+        <L t="Capabilities — one per line: key | label"><textarea className="mono" value={f.caps} onChange={set('caps')} rows={3} /></L>
       </fieldset>
       <div className="row">
         <button className="primary" disabled={busy} onClick={() => save(false)}>Save</button>
-        <button disabled={busy} onClick={() => save(true)}>Save and check</button>
+        <button disabled={busy} onClick={() => save(true)}>Save & Check</button>
       </div>
     </section>
   );
 }
 const L = ({ t, children }: { t: string; children: ReactNode }) => <label className="field"><span>{t}</span>{children}</label>;
+
+// ═══════════════════════════════════════════════════════════
+// Signing Settings
+// ═══════════════════════════════════════════════════════════
 
 const SIGNING_MODES = [
   { mode: 'off', title: 'Off', text: 'Agents cannot sign over SSH. iPhone/release builds fail with errSecInternalComponent.' },
@@ -273,7 +364,7 @@ function SigningSettings({ h, act, busy }: { h: any; act: (fn: () => Promise<unk
   });
   return (
     <>
-      <h3>Code signing over SSH</h3>
+      <h3>Code Signing over SSH</h3>
       <p className="muted small">macOS unlocks a keychain only for the SSH session that unlocked it. Agents run signing builds through the manager's runner, which unlocks it inside that same session. The secret never reaches the agent.</p>
       {SIGNING_MODES.map((m) => (
         <label key={m.mode} className="signing-mode">
@@ -288,7 +379,7 @@ function SigningSettings({ h, act, busy }: { h: any; act: (fn: () => Promise<unk
             ? <>Build keychain ready ({age(s.build_keychain.set_up_at)}): {s.build_keychain.identities.map((i: any) => i.name).join(', ')}</>
             : <span className="warn">Build keychain not set up yet.{s.build_keychain?.last_error ? ` Last attempt: ${s.build_keychain.last_error}` : ''}</span>}
           {' '}<button disabled={busy} onClick={() => act(() => call('setupBuildKeychain', { host_id: h.id }))}>{s.build_keychain_secret_stored ? 'Set up again (after a certificate renewal)' : 'Set up now'}</button>
-          {s.build_keychain?.needs_p12 && <div className="warnbox">macOS won't let the manager copy your signing key without a click on the Mac. Do this once: on the Mac open Keychain Access → login → My Certificates, right-click “Apple Development: …” → Export… as .p12 with a password, copy the file to this PC, then import it here.</div>}
+          {s.build_keychain?.needs_p12 && <div className="warnbox">macOS won't let the manager copy your signing key without a click on the Mac. Do this once: on the Mac open Keychain Access → login → My Certificates, right-click "Apple Development: …" → Export… as .p12 with a password, copy the file to this PC, then import it here.</div>}
           <div className="row">
             <input type="password" placeholder=".p12 password" value={p12pw} onChange={(e) => setP12pw(e.target.value)} />
             <button disabled={busy} onClick={() => act(async () => { const r = await window.api.importP12(h.id, p12pw); if (r && !r.ok) throw r.error; setP12pw(''); })}>Import .p12…</button>
@@ -299,27 +390,50 @@ function SigningSettings({ h, act, busy }: { h: any; act: (fn: () => Promise<unk
   );
 }
 
+// ═══════════════════════════════════════════════════════════
+// Host Detail
+// ═══════════════════════════════════════════════════════════
+
 function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; onEdit: () => void }) {
   const { data: h, error, reload } = usePoll(() => call('getHost', { host_id: id }), [id]);
   const hist = usePoll(() => call('hostHistory', { host_id: id, limit: 15 }), [id], 5000);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [lastCheck, setLastCheck] = useState<any>(null);
   const [probes, setProbes] = useState('binary:git');
   const [busy, setBusy] = useState(false);
-  const act = async (fn: () => Promise<unknown>) => { setBusy(true); setMsg(null); try { await fn(); } catch (e) { setMsg(errText(e)); } finally { setBusy(false); reload(); hist.reload(); } };
-  if (error) return <section><button onClick={onBack}>← Back</button><Err e={error} /></section>;
+  const act = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await fn();
+    } catch (e) {
+      setErr(errText(e));
+    } finally {
+      setBusy(false);
+      reload();
+      hist.reload();
+    }
+  };
+  if (error) return <section><button className="ghost" onClick={onBack}>← Back</button><Err e={error} /></section>;
   if (!h) return <p className="muted">Loading…</p>;
   const env = navigator.userAgent.includes('Windows') ? 'windows-native' : 'posix-native';
   return (
     <section>
-      <div className="row"><button onClick={onBack}>← Hosts</button><h2>{h.name}</h2><Badge s={h.status} /></div>
-      <div className="id">ID {h.id} · revision {h.revision} · identity generation {h.identity_generation}</div>
-      <Err e={msg} />
-      <div className="row">
-        <button className="primary" disabled={busy} onClick={() => act(async () => { const r = await checkHost(id); setLastCheck(r); if (r.key_auth) setMsg(r.key_auth); })}>Check now</button>
-        <button onClick={() => act(async () => { const r = await call('connectionRecipe', { host_id: id, caller_environment: env }); await copy(r.display); setMsg('SSH command copied to clipboard'); })}>Copy SSH command</button>
-        <button onClick={() => act(async () => { const r = await call('connectionRecipe', { host_id: id, caller_environment: env, purpose: 'file_transfer' }); await copy(r.display); setMsg('scp template copied'); })}>Copy scp template</button>
+      <div className="page-header">
+        <button className="ghost" onClick={onBack}>← Hosts</button>
+        <h2>{h.name}</h2>
+        <Badge s={h.status} />
+        <div className="spacer" />
+        <button className="primary" disabled={busy} onClick={() => act(async () => { const r = await checkHost(id); setLastCheck(r); if (r.key_auth) setSuccessMsg(r.key_auth); })}>Check Now</button>
         <button onClick={onEdit}>Edit</button>
+      </div>
+      <div className="id">ID {h.id} · rev {h.revision} · identity gen {h.identity_generation}</div>
+      <Err e={err} />
+      {successMsg && <div className="success">✓ {successMsg}</div>}
+      <div className="row">
+        <button onClick={() => act(async () => { const r = await call('connectionRecipe', { host_id: id, caller_environment: env }); await copy(r.display); setSuccessMsg('SSH command copied to clipboard'); })}>📋 Copy SSH Command</button>
+        <button onClick={() => act(async () => { const r = await call('connectionRecipe', { host_id: id, caller_environment: env, purpose: 'file_transfer' }); await copy(r.display); setSuccessMsg('scp template copied to clipboard'); })}>📋 Copy scp Template</button>
         <button onClick={() => act(() => call('updateHost', { host_id: id, expected_revision: h.revision, patch: { metadata: { enabled: !h.enabled } }, idempotency_key: idem() }))}>{h.enabled ? 'Disable' : 'Enable'}</button>
         <button className="danger" onClick={() => {
           if (confirm(`Remove "${h.name}" from this app?\n\nOnly the local record is deleted. Nothing on the remote machine, your SSH keys or ssh config is touched.`)) {
@@ -330,7 +444,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
       {(h.status.state === 'trust_required' || h.status.state === 'host_key_changed') && !lastCheck?.trust_candidates && (
         <div className="error">
           {h.status.state === 'trust_required' ? 'This host\'s key is not trusted yet, so no login (password or key) is attempted.' : 'The host key CHANGED since it was trusted. Do not continue unless you know why.'}
-          {' '}<button disabled={busy} onClick={() => act(async () => { const r = await checkHost(id); setLastCheck(r); if (r.key_auth) setMsg(r.key_auth); })}>Show fingerprint to verify</button>
+          {' '}<button disabled={busy} onClick={() => act(async () => { const r = await checkHost(id); setLastCheck(r); if (r.key_auth) setSuccessMsg(r.key_auth); })}>Show fingerprint to verify</button>
         </div>
       )}
       {lastCheck?.trust_candidates && Array.isArray(lastCheck.trust_candidates) && (
@@ -358,7 +472,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
           <p>OS: declared <b>{h.declared_os}</b>, observed <b>{h.observed_os ?? '—'}</b> {h.observed_os_detail && <span className="muted">({h.observed_os_detail})</span>} {h.os_mismatch && <span className="badge warn">mismatch</span>}</p>
           <p>Authentication: <b>{h.auth === 'password' ? 'username + password' : 'SSH key / agent'}</b>{h.auth === 'password' && (h.password_stored ? ' · password stored (encrypted)' : <span className="warn"> · no password stored — Edit to set it</span>)}
             {h.auth === 'password' && h.password_stored && h.profile.mode === 'direct' && <> <button disabled={busy} title="Generates an SSH key on this PC, installs it on the host using the stored password, tests a key-only login, then switches. The password stays stored."
-              onClick={() => act(async () => { const r = await call('switchToKeyAuth', { host_id: id }); setMsg(r.note); })}>Switch to SSH key</button></>}
+              onClick={() => act(async () => { const r = await call('switchToKeyAuth', { host_id: id }); setSuccessMsg(r.note); })}>Switch to SSH key</button></>}
             {h.ssh_alias && <> · from any terminal: <span className="mono">ssh {h.ssh_alias}</span></>}</p>
           <p>Trusted keys: {h.trust.length ? h.trust.map((t: any) => `${t.algorithm} ${t.fingerprint} (${age(t.approved_at)})`).join('; ') : h.profile.mode === 'ssh_alias' ? 'user-managed known_hosts' : 'none'}</p>
           <h3>Description</h3><p className="pre">{h.description || <span className="muted">—</span>}</p>
@@ -368,19 +482,19 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
         </div>
         <div>
           <h3>Capabilities</h3>
-          <p className="muted">Declared is a claim. Observed comes from a probe at a point in time.</p>
-          <table><thead><tr><th>Key</th><th>Declared</th><th>Observed</th></tr></thead><tbody>
+          <p className="muted small">Declared is a claim. Observed comes from a probe at a point in time.</p>
+          <table className="inline-table"><thead><tr><th>Key</th><th>Declared</th><th>Observed</th></tr></thead><tbody>
             {h.capabilities.map((c: any) => <tr key={c.key}><td className="mono">{c.key}</td><td>{c.label || c.declared_description || '✓'} <span className="muted">({c.declaration_source})</span></td>
               <td>{c.observation ? <><span className={`badge cap-${c.observation.state}`}>{c.observation.state}</span> {age(c.observed_at)}<div className="muted small pre">{c.observation.details}</div></> : <span className="muted">not probed</span>}</td></tr>)}
           </tbody></table>
           <div className="row"><input className="mono grow" value={probes} onChange={(e) => setProbes(e.target.value)} title="comma separated: macos.xcode, binary:git" />
             <button disabled={busy} onClick={() => act(async () => setLastCheck(await call('probeCapabilities', { host_id: id, probe_ids: probes.split(',').map((s) => s.trim()).filter(Boolean) })))}>Probe</button></div>
           {lastCheck?.observations && <pre className="small">{JSON.stringify(lastCheck.observations, null, 1)}</pre>}
-          <h3>Child resources</h3>
+          <h3>Child Resources</h3>
           {h.resources.length === 0 ? <p className="muted">None (e.g. an iPhone attached to this Mac). Agents can add them via ssh_hosts_update.</p>
             : <ul>{h.resources.map((r: any) => <li key={r.id}>{r.label} <span className="muted">({r.resource_kind})</span></li>)}</ul>}
           <h3>History</h3>
-          <table className="small"><thead><tr><th>When</th><th>Kind</th><th>Outcome</th><th>ms</th></tr></thead><tbody>
+          <table className="inline-table small"><thead><tr><th>When</th><th>Kind</th><th>Outcome</th><th>ms</th></tr></thead><tbody>
             {(hist.data?.checks ?? []).map((c: any) => <tr key={c.id} title={c.diagnostics?.stderr ?? ''}><td>{age(c.started_at)}</td><td>{c.kind}</td>
               <td>{c.outcome ?? 'running'} {c.error_code}{c.identity_generation !== h.identity_generation ? ' (old settings)' : ''}</td><td>{c.duration_ms}</td></tr>)}
           </tbody></table>
@@ -391,7 +505,9 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
   );
 }
 
-// ---------------- projects (per host: PC source folder → folder on this host) ----------------
+// ═══════════════════════════════════════════════════════════
+// Projects on host
+// ═══════════════════════════════════════════════════════════
 
 /** Browses folders on the remote host over SSH (read-only). Never a local file dialog for remote paths. */
 function RemoteFolderPicker({ hostId, start, onPick, onClose }: { hostId: string; start: string; onPick: (p: string) => void; onClose: () => void }) {
@@ -408,7 +524,7 @@ function RemoteFolderPicker({ hostId, start, onPick, onClose }: { hostId: string
   return (
     <div className="modal-back" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="row"><b>Choose a folder on the host</b><span className="grow" /><button onClick={onClose}>✕</button></div>
+        <div className="row"><b>Choose a folder on the host</b><span className="grow" /><button className="ghost" onClick={onClose}>✕</button></div>
         <div className="row">
           <button disabled={!res?.parent} onClick={() => setPath(res.parent)}>↑ Up</button>
           <button onClick={() => setPath('~')}>~ Home</button>
@@ -428,7 +544,7 @@ function RemoteFolderPicker({ hostId, start, onPick, onClose }: { hostId: string
         </div>
         <div className="row">
           <span className="muted small grow">Double-click to open · click to select</span>
-          <button className="primary" disabled={!typed || !!res?.error && typed === res?.path} onClick={() => onPick(typed)}>Use “{typed.length > 40 ? '…' + typed.slice(-40) : typed}”</button>
+          <button className="primary" disabled={!typed || !!res?.error && typed === res?.path} onClick={() => onPick(typed)}>Use "{typed.length > 40 ? '…' + typed.slice(-40) : typed}"</button>
         </div>
       </div>
     </div>
@@ -621,15 +737,98 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
   );
 }
 
-// ---------------- setup ----------------
+// ═══════════════════════════════════════════════════════════
+// Setup Tab
+// ═══════════════════════════════════════════════════════════
+
+
+
+function QuickBindSection({ mcpConfigJson }: { mcpConfigJson: string }) {
+  const [copyMsg, setCopyMsg] = useState<string | null>(null);
+
+  const doCopy = async (target: string) => {
+    await copy(mcpConfigJson);
+    setCopyMsg(`MCP config copied! Paste it into your ${target} configuration file.`);
+    setTimeout(() => setCopyMsg(null), 4000);
+  };
+
+  const tools = [
+    {
+      id: 'claude',
+      name: 'Claude Desktop',
+      desc: 'Anthropic\'s Claude AI assistant',
+      icon: '🟠',
+      iconClass: 'claude',
+      configHint: 'claude_desktop_config.json → mcpServers',
+      docUrl: 'Settings → Developer → Edit Config',
+    },
+    {
+      id: 'codex',
+      name: 'Codex CLI',
+      desc: 'OpenAI\'s terminal coding agent',
+      icon: '🟢',
+      iconClass: 'codex',
+      configHint: '.codex/config.json → mcpServers',
+      docUrl: 'codex --configure',
+    },
+    {
+      id: 'antigravity',
+      name: 'Antigravity',
+      desc: 'Google\'s agentic coding assistant',
+      icon: '🔵',
+      iconClass: 'antigravity',
+      configHint: '.gemini/settings.json → mcpServers',
+      docUrl: 'Already configured if installed as plugin',
+    },
+  ];
+
+  return (
+    <fieldset>
+      <legend>Quick Bind — AI Agent Integration</legend>
+      <p className="muted small" style={{ marginBottom: 12 }}>
+        Connect this SSH manager to your AI coding tools. Copy the MCP configuration and paste it into each tool's config file. This app never edits client configs.
+      </p>
+      {copyMsg && <div className="success">✓ {copyMsg}</div>}
+      <div className="quick-bind-grid">
+        {tools.map((tool) => (
+          <div key={tool.id} className="bind-card">
+            <div className="bind-card-header">
+              <div className={`bind-card-icon ${tool.iconClass}`}>{tool.icon}</div>
+              <div className="bind-card-info">
+                <div className="bind-name">{tool.name}</div>
+                <div className="bind-desc">{tool.desc}</div>
+              </div>
+            </div>
+            <div className="muted small" style={{ fontSize: 11 }}>
+              Config: <span className="mono">{tool.configHint}</span>
+            </div>
+            <div className="muted small" style={{ fontSize: 11 }}>
+              {tool.docUrl}
+            </div>
+            <div className="bind-card-actions">
+              <button className="primary" onClick={() => doCopy(tool.name)}>📋 Copy MCP Config</button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <details style={{ marginTop: 8 }}>
+        <summary className="muted small" style={{ cursor: 'pointer' }}>View raw MCP configuration JSON</summary>
+        <pre style={{ marginTop: 8 }}>{mcpConfigJson}</pre>
+      </details>
+    </fieldset>
+  );
+}
 
 function StartupSettings() {
   const [li, setLi] = useState<{ supported: boolean; enabled: boolean } | null>(null);
   useEffect(() => { window.api.loginItem().then(setLi); }, []);
   return (
-    <fieldset><legend>Startup and tray</legend>
+    <fieldset><legend>Startup & Tray</legend>
       <p className="muted small">Closing the window keeps the app in the tray. AI agents also start it in the tray when they connect. To exit completely, right-click the tray icon → Quit.</p>
-      <label><input type="checkbox" disabled={!li?.supported} checked={!!li?.enabled} onChange={async (e) => setLi(await window.api.setLoginItem(e.target.checked))} /> Start with Windows (in the tray, no window)</label>
+      <label style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+        <input type="checkbox" disabled={!li?.supported} checked={!!li?.enabled} onChange={async (e) => setLi(await window.api.setLoginItem(e.target.checked))} />
+        Start with Windows (in the tray, no window)
+      </label>
       {li && !li.supported && <div className="muted small">Available in the installed app only.</div>}
     </fieldset>
   );
@@ -641,40 +840,83 @@ function Setup() {
   const [cfg, setCfg] = useState<string>('');
   const [msg, setMsg] = useState<string | null>(null);
   const [imp, setImp] = useState<any>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
   useEffect(() => {
-    call('getSettings').then(setS); call('environment').then(setEnv);
-    window.api.mcpConfig().then((c) => setCfg(JSON.stringify(c, null, 2)));
+    Promise.all([
+      call('getSettings').then(setS).catch((e) => setLoadError(errText(e))),
+      call('environment').then(setEnv).catch((e) => setLoadError(errText(e))),
+      window.api.mcpConfig().then((c) => setCfg(JSON.stringify(c, null, 2))).catch((e) => setLoadError(errText(e))),
+    ]);
   }, []);
-  if (!s || !env) return <p className="muted">Loading…</p>;
-  const save = async (patch: object) => { try { setS(await call('setSettings', patch)); setMsg('Saved'); } catch (e) { setMsg(errText(e)); } };
+
+  if (loadError) return (
+    <section>
+      <div className="page-header"><h2>Setup</h2></div>
+      <div className="error">{loadError}</div>
+    </section>
+  );
+  if (!s || !env) return (
+    <section>
+      <div className="page-header"><h2>Setup</h2></div>
+      <p className="muted">Loading configuration…</p>
+    </section>
+  );
+
+  const save = async (patch: object) => { try { setS(await call('setSettings', patch)); setMsg('Saved'); setTimeout(() => setMsg(null), 2000); } catch (e) { setMsg(errText(e)); } };
+
   return (
     <section>
-      <h2>Setup</h2>
+      <div className="page-header">
+        <h2>Setup</h2>
+      </div>
       {msg && <div className="note">{msg}</div>}
+
+      {/* Quick Bind Section */}
+      <QuickBindSection mcpConfigJson={cfg} />
+
+      {/* Environment */}
       <fieldset><legend>Environment</legend>
-        <p>Execution environment: <b>{env.execution_environment}</b>. Agents must call from the same environment (e.g. PowerShell on Windows, not WSL).</p>
-        <p>Data directory: <span className="mono">{env.data_dir}</span> <button onClick={() => window.api.openDataDir()}>Open</button></p>
-        <p>App known_hosts: <span className="mono">{env.known_hosts}</span></p>
+        <div className="setup-grid">
+          <div>
+            <p><span className="muted small">Execution environment</span><br /><b>{env.execution_environment}</b></p>
+            <p className="muted small" style={{ marginTop: 4 }}>Agents must call from the same environment (e.g. PowerShell on Windows, not WSL).</p>
+          </div>
+          <div>
+            <p><span className="muted small">Data directory</span><br /><span className="mono">{env.data_dir}</span></p>
+            <button style={{ marginTop: 6 }} onClick={() => window.api.openDataDir()}>Open Data Dir</button>
+          </div>
+          <div>
+            <p><span className="muted small">App known_hosts</span><br /><span className="mono">{env.known_hosts}</span></p>
+          </div>
+        </div>
       </fieldset>
-      <fieldset><legend>OpenSSH</legend>
+
+      {/* OpenSSH */}
+      <fieldset><legend>OpenSSH & Tooling</legend>
         <div className="grid">
           {(['ssh_path', 'scp_path', 'sftp_path', 'ssh_keygen_path', 'git_path'] as const).map((k) => (
             <L key={k} t={k}><input className="mono" defaultValue={s[k]} onBlur={(e) => e.target.value !== s[k] && save({ [k]: e.target.value })} /></L>
           ))}
-          {(['connect_timeout_s', 'check_timeout_s', 'probe_timeout_s', 'stale_after_seconds'] as const).map((k) => (
-            <L key={k} t={k}><input defaultValue={s[k]} inputMode="numeric" onBlur={(e) => Number(e.target.value) !== s[k] && save({ [k]: Number(e.target.value) })} /></L>
-          ))}
-          <label><input type="checkbox" checked={s.gui_auto_check} onChange={(e) => save({ gui_auto_check: e.target.checked })} /> Auto-check stale enabled hosts every 60 s while the GUI is open</label>
         </div>
+        <h3>Timeouts</h3>
+        <div className="grid">
+          {(['connect_timeout_s', 'check_timeout_s', 'probe_timeout_s', 'stale_after_seconds'] as const).map((k) => (
+            <L key={k} t={k.replaceAll('_', ' ')}><input defaultValue={s[k]} inputMode="numeric" onBlur={(e) => Number(e.target.value) !== s[k] && save({ [k]: Number(e.target.value) })} /></L>
+          ))}
+        </div>
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}>
+          <input type="checkbox" checked={s.gui_auto_check} onChange={(e) => save({ gui_auto_check: e.target.checked })} />
+          Auto-check stale enabled hosts every 60s while the GUI is open
+        </label>
       </fieldset>
-      <fieldset><legend>MCP client configuration</legend>
-        <p>Add this to your AI client's MCP config (e.g. Claude Desktop / Claude Code). This app never edits client configs.</p>
-        <pre>{cfg}</pre>
-        <button onClick={() => copy(cfg)}>Copy</button>
-        <p className="muted">Test: ask your agent to call <span className="mono">ssh_manager_environment</span>, then <span className="mono">ssh_hosts_list</span>. MCP gives the agent registry tools only; it still needs its own terminal to run ssh. See docs/AGENT_INSTRUCTIONS.md.</p>
-      </fieldset>
+
+      {/* Startup */}
       <StartupSettings />
-      <fieldset><legend>Export / import / backup</legend>
+
+      {/* Export / Import */}
+      <fieldset><legend>Data Management</legend>
+        <p className="muted small" style={{ marginBottom: 10 }}>Export, import, or back up your SSH host registry data.</p>
         <div className="row">
           <button onClick={async () => { const p = await window.api.exportData(); if (p) setMsg(`Exported to ${p} (no keys, trust approvals or diagnostics)`); }}>Export metadata…</button>
           <button onClick={async () => { const r = await window.api.importPreview(); if (r) setImp(r); }}>Import…</button>
@@ -685,11 +927,19 @@ function Setup() {
             <p>{imp.result.note}</p>
             <ul>{imp.result.hosts.map((h: any, i: number) => <li key={i}>{h.name} <span className="mono">{h.target}</span> {h.duplicates.length ? <span className="badge warn">possible duplicate</span> : null}</li>)}</ul>
             <p>{imp.result.projects.length} project(s); local paths will need review.</p>
-            <button className="primary" onClick={async () => { const r = await window.api.importApply(); setMsg(r.ok ? JSON.stringify(r.result) : errText(new CallError(r.error))); setImp(null); }}>Import as new records</button>
-            <button onClick={() => setImp(null)}>Cancel</button>
+            <div className="row">
+              <button className="primary" onClick={async () => { const r = await window.api.importApply(); setMsg(r.ok ? JSON.stringify(r.result) : errText(new CallError(r.error))); setImp(null); }}>Import as new records</button>
+              <button onClick={() => setImp(null)}>Cancel</button>
+            </div>
           </div>
         ) : <div className="error">{imp.error.message}</div>)}
       </fieldset>
+
+      <p className="muted small" style={{ marginTop: 16 }}>
+        Test MCP: ask your agent to call <span className="mono">ssh_manager_environment</span>, then <span className="mono">ssh_hosts_list</span>.
+        MCP gives the agent registry tools only; it still needs its own terminal to run ssh.
+        See docs/AGENT_INSTRUCTIONS.md.
+      </p>
     </section>
   );
 }
