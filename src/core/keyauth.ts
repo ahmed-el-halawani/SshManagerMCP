@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { sshRun, type Ctx } from './checks.ts';
 import { AppError } from './errors.ts';
-import { getHostRow, profileOf, updateHost } from './hosts.ts';
+import { connectProfile, getHostRow, profileOf, updateHost } from './hosts.ts';
 import { hasPassword } from './secrets.ts';
 import { getSettings } from './settings.ts';
 import { ensureInclude, restrictToOwner, sshAlias, writeSshConfig } from './sshconfig.ts';
@@ -63,7 +63,7 @@ export async function switchToKeyAuth(ctx: Ctx, raw: unknown) {
   // Prove the key works on its own before switching: BatchMode=yes, pubkey only.
   const keyProfile = { ...p, auth: 'key' as const, identity_file: key.path, identities_only: true };
   const s = getSettings(ctx.db);
-  const { args, env } = sshArgs(keyProfile, ctx.dataDir, s, 'echo @@KEYOK', row.id);
+  const { args, env } = sshArgs({ ...connectProfile(row), ...keyProfile }, ctx.dataDir, s, 'echo @@KEYOK', row.id);
   const test = await run(splitCommand(s.ssh_path), args, { timeoutMs: s.check_timeout_s * 1000, env });
   if (!test.stdout.includes('@@KEYOK')) {
     throw new AppError('AUTH_REQUIRED', `the key was added to authorized_keys, but a key-only login failed: ${sanitize(test.stderr).slice(0, 300)}`, {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createServer, type AddressInfo } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -287,4 +288,32 @@ test('duplicate host: copies profile, metadata, capabilities and password', () =
   const dup2 = core.duplicateHost({ host_id: h.id, new_name: 'Staging Server', copy_password: false, idempotency_key: key() }).host;
   assert.equal(dup2.name, 'Staging Server');
   assert.equal(dup2.password_stored, false, 'password was excluded');
+});
+
+test('several addresses: check uses the one that answers, pins it to the primary host key, keeps identity', async () => {
+  const server = createServer((s) => s.end());
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const core = makeCore();
+    // 127.0.0.2 has no listener on that port (refused); 127.0.0.1 answers.
+    const h = core.registerHost({ profile: { mode: 'direct', hostname: '127.0.0.2', port, username: 'dev' }, metadata: { name: 'multi' }, idempotency_key: key() }).host;
+    const u = core.updateHost({ host_id: h.id, expected_revision: 1, idempotency_key: key(),
+      patch: { profile: { mode: 'direct', hostname: '127.0.0.2', alternate_hostnames: ['127.0.0.1'], port, username: 'dev' } } }).host;
+    assert.equal(u.identity_generation, h.identity_generation, 'adding an address is not a new endpoint');
+    const argsFile = join(mkdtempSync(join(tmpdir(), 'sshrm-args-')), 'args.json');
+    process.env.FAKE_SSH_MODE = 'sh';
+    process.env.FAKE_SSH_ARGS_FILE = argsFile;
+    const r = await core.checkHost({ host_id: h.id }) as { success: boolean; address: string; addresses: { address: string; latency_ms: number | null }[] };
+    delete process.env.FAKE_SSH_ARGS_FILE;
+    assert.equal(r.success, true);
+    assert.equal(r.address, '127.0.0.1');
+    assert.equal(r.addresses.find((a) => a.address === '127.0.0.2')?.latency_ms, null);
+    const args = JSON.parse(readFileSync(argsFile, 'utf8')) as string[];
+    assert.ok(args.includes(`HostKeyAlias=[127.0.0.2]:${port}`));
+    assert.equal(args[args.indexOf('--') + 1], '127.0.0.1');
+    assert.equal(core.getHost({ host_id: h.id }).active_address, '127.0.0.1');
+    const recipe = core.connectionRecipe({ host_id: h.id, caller_environment: 'windows-native' }) as { argv: string[] };
+    assert.equal(recipe.argv.at(-1), '127.0.0.1');
+  } finally { server.close(); }
 });

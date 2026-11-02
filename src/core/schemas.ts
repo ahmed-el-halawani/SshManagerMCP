@@ -21,6 +21,8 @@ const LocalPath = z.string().min(1).max(1024).refine(noControl, 'path contains c
 export const DirectProfile = z.object({
   mode: z.literal('direct'),
   hostname: Hostname,
+  /** Other addresses of the same machine (another Wi-Fi, a VPN). A check picks the fastest reachable one; all must present hostname's host key. */
+  alternate_hostnames: z.array(Hostname).max(10).optional(),
   port: z.number().int().min(1).max(65535).default(22),
   username: Username,
   /** 'password': the password itself is set in the GUI only and stored DPAPI-encrypted, never in the profile. */

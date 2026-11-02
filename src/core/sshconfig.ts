@@ -10,8 +10,8 @@ import { spawnSync } from 'node:child_process';
 import { homedir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { DB } from './db.ts';
-import { profileOf, type HostRow } from './hosts.ts';
-import { cfgPath, knownHostsPath } from './ssh.ts';
+import { connectProfile, profileOf, type HostRow } from './hosts.ts';
+import { cfgPath, hostKeyAlias, knownHostsPath } from './ssh.ts';
 
 export const sshConfigPath = (dataDir: string) => join(dataDir, 'ssh_config');
 const userConfigPath = () => join(homedir(), '.ssh', 'config');
@@ -34,7 +34,9 @@ function render(db: DB, dataDir: string) {
     for (let n = 2; taken.has(alias); n++) alias = `sshrm-${slug}-${n}`;
     taken.add(alias);
     aliases.set(row.id, alias);
-    blocks.push([`# ${row.name} (host ${row.id})`, `Host ${alias}`, `  HostName ${p.hostname}`, `  Port ${p.port}`, `  User ${p.username}`,
+    // Several addresses: the alias follows the one the last check picked (the file is rewritten after each check).
+    blocks.push([`# ${row.name} (host ${row.id})`, `Host ${alias}`, `  HostName ${connectProfile(row).address ?? p.hostname}`, `  Port ${p.port}`, `  User ${p.username}`,
+      ...(p.alternate_hostnames?.length ? [`  HostKeyAlias ${hostKeyAlias(p)}`] : []),
       ...(p.identity_file ? [`  IdentityFile ${cfgPath(p.identity_file)}`] : []), ...(p.identities_only ? ['  IdentitiesOnly yes'] : []),
       ...(p.proxy_jump?.length ? [`  ProxyJump ${p.proxy_jump.join(',')}`] : []),
       `  UserKnownHostsFile ${cfgPath(knownHostsPath(dataDir))}`, '  StrictHostKeyChecking yes'].join('\n'));

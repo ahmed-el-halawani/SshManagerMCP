@@ -53,7 +53,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     listHosts: (i: Parameters<typeof listHosts>[1] = {}) => listHosts(db, i),
     getHost: (i: { host_id: string }) => { const id = z.uuid().parse(i.host_id); return { ...getHost(db, id), ssh_alias: sshAlias(db, dataDir, id) }; },
     removeHost: (i: unknown) => syncConfig(removeHost(db, s, i)),
-    checkHost: (i: unknown) => checkHost(ctx, i),
+    checkHost: (i: unknown) => checkHost(ctx, i).then(syncConfig), // may switch a multi-address host to another address
     probeCapabilities: (i: unknown) => probeCapabilities(ctx, i),
     approveHostKey: (i: unknown) => approveHostKey(ctx, i),
     connectionRecipe: (i: unknown) => connectionRecipe(ctx, i),

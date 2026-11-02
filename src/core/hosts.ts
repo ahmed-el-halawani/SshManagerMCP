@@ -10,7 +10,7 @@ export type HostRow = {
   declared_os: string; observed_os: string | null; observed_os_detail: string | null;
   description: string; instructions: string; tags_json: string; default_remote_directory: string | null;
   created_at: string; updated_at: string; revision: number; last_check_id: string | null; identity_generation: number;
-  signing_mode: 'off' | 'login_keychain' | 'build_keychain'; signing_state_json: string | null;
+  signing_mode: 'off' | 'login_keychain' | 'build_keychain'; signing_state_json: string | null; active_hostname: string | null;
 };
 
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -44,12 +44,24 @@ export function getHostRow(db: DB, id: string): HostRow {
 
 export const profileOf = (row: HostRow): Profile => JSON.parse(row.connection_profile_json);
 
+/** Every address of a direct host, primary first. */
+export const addressesOf = (p: Profile): string[] => (p.mode === 'direct' ? [...new Set([p.hostname, ...(p.alternate_hostnames ?? [])])] : []);
+
+/** The profile to connect with: `address` is the alternate the last check picked (absent = the primary hostname). */
+export function connectProfile(row: HostRow): Profile & { address?: string } {
+  const p = profileOf(row);
+  const a = row.active_hostname;
+  return a && a !== (p as { hostname?: string }).hostname && addressesOf(p).includes(a) ? { ...p, address: a } : p;
+}
+
 /**
  * Fields that define *which* account/endpoint we talk to. Changing any invalidates trust/check state.
  * How we authenticate to that same account (auth, key file) is not identity: switching password -> key keeps trust and secrets.
+ * Alternate addresses are not identity either: every address must present the primary hostname's trusted key (HostKeyAlias).
  */
 const identityKey = (p: Profile) => {
-  const { remote_shell_hint: _h, auth: _a, identity_file: _i, identities_only: _o, ...rest } = p as Profile & { remote_shell_hint?: string; identity_file?: string; identities_only?: boolean };
+  const { remote_shell_hint: _h, auth: _a, identity_file: _i, identities_only: _o, alternate_hostnames: _alt, ...rest } =
+    p as Profile & { remote_shell_hint?: string; identity_file?: string; identities_only?: boolean; alternate_hostnames?: string[] };
   return JSON.stringify(rest);
 };
 
@@ -96,9 +108,11 @@ function capabilities(db: DB, hostId: string) {
 }
 
 export function hostSummary(db: DB, row: HostRow) {
+  const p = profileOf(row);
   return {
     id: row.id, name: row.name, enabled: !!row.enabled, connection_mode: row.connection_mode,
-    target: targetSummary(profileOf(row)), declared_os: row.declared_os, observed_os: row.observed_os,
+    target: targetSummary(p), ...(addressesOf(p).length > 1 ? { active_address: connectProfile(row).address ?? addressesOf(p)[0] } : {}),
+    declared_os: row.declared_os, observed_os: row.observed_os,
     os_mismatch: !!row.observed_os && row.declared_os !== 'unknown' && row.observed_os !== row.declared_os,
     tags: JSON.parse(row.tags_json) as string[], revision: row.revision, status: hostStatus(db, row),
     capability_keys: capabilities(db, row.id).filter((c) => c.enabled).map((c) => c.key),

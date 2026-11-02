@@ -23,7 +23,7 @@ import { z } from 'zod';
 import { sshRun, type Ctx } from './checks.ts';
 import { now, tx } from './db.ts';
 import { AppError } from './errors.ts';
-import { audit, getHostRow, profileOf, type HostRow } from './hosts.ts';
+import { audit, connectProfile, getHostRow, type HostRow } from './hosts.ts';
 import { getSecret, hasSecret, putSecret } from './secrets.ts';
 import { getSettings } from './settings.ts';
 import { posixQuote, psQuote, sanitize, splitCommand, sshArgs } from './ssh.ts';
@@ -144,7 +144,7 @@ export async function prepareSignedRun(ctx: Ctx, input: { host_id: string; comma
   const secret = getSecret(ctx.db, row.id, row.signing_mode === 'login_keychain' ? 'password' : 'build_keychain');
   if (!secret) throw new AppError('AUTH_REQUIRED', 'no stored secret for this signing mode');
   const s = getSettings(ctx.db);
-  const { args, env } = sshArgs(profileOf(row), ctx.dataDir, s, signedRemoteCommand(row.signing_mode, input.command), row.id);
+  const { args, env } = sshArgs(connectProfile(row), ctx.dataDir, s, signedRemoteCommand(row.signing_mode, input.command), row.id);
   return { mode: row.signing_mode, command: splitCommand(s.ssh_path), args, env, stdin: `${secret}\n` };
 }
 

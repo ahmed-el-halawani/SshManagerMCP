@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { connect } from 'node:net';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { type DB, now, tx } from './db.ts';
 import { AppError } from './errors.ts';
-import { audit, getHost, getHostRow, profileOf, targetSummary, type HostRow } from './hosts.ts';
+import { addressesOf, audit, connectProfile, getHost, getHostRow, profileOf, targetSummary, type HostRow } from './hosts.ts';
 import { executionEnvironment } from './paths.ts';
 import type { Profile, Source } from './schemas.ts';
 import { getSettings, type Settings } from './settings.ts';
@@ -21,7 +22,7 @@ const lines = (s: string) => s.split(/\r?\n/).map((l) => l.trim());
 // With no stored password the askpass helper declines, so ssh still reports trust problems first.
 export async function sshRun(ctx: Ctx, row: HostRow, cmd: string, timeoutS: number, extra: { maxBytes?: number; input?: string } = {}): Promise<RunResult> {
   const s = getSettings(ctx.db);
-  const p = profileOf(row);
+  const p = connectProfile(row);
   const { args, env } = sshArgs(p, ctx.dataDir, s, cmd, row.id);
   const r = await run(splitCommand(s.ssh_path), args, { timeoutMs: timeoutS * 1000, env, ...extra });
   if (p.auth === 'password' && /Permission denied/i.test(r.stderr) && !hasPassword(ctx.db, row.id)) r.stderr += '\n(no password is stored for this host; set it in the GUI host editor)';
@@ -72,7 +73,8 @@ function acquireCheckLease(ctx: Ctx, row: HostRow, kind: 'connectivity' | 'capab
     const held = ctx.db.prepare('SELECT check_id FROM check_leases WHERE host_id=?').get(row.id) as { check_id: string } | undefined;
     if (held) throw new AppError('CHECK_IN_PROGRESS', 'a check for this host is already running', { retryable: true, details: { host_id: row.id, check_id: held.check_id } });
     const id = randomUUID();
-    const expires = new Date(Date.now() + (s.check_timeout_s * 2 + s.probe_timeout_s * 4 + 10) * 1000).toISOString();
+    const tries = Math.max(1, addressesOf(profileOf(row)).length);
+    const expires = new Date(Date.now() + (s.check_timeout_s * 2 * tries + s.connect_timeout_s + s.probe_timeout_s * 4 + 10) * 1000).toISOString();
     ctx.db.prepare('INSERT INTO check_leases(host_id, check_id, expires_at) VALUES(?,?,?)').run(row.id, id, expires);
     ctx.db.prepare(`INSERT INTO checks(id, host_id, host_revision, identity_generation, kind, started_at, probe_version, effective_target_summary) VALUES(?,?,?,?,?,?,?,?)`)
       .run(id, row.id, row.revision, row.identity_generation, kind, t, PROBE_VERSION, targetSummary(profileOf(row)));
@@ -99,25 +101,66 @@ function finishCheck(ctx: Ctx, row: HostRow, checkId: string, started: number, o
   });
 }
 
+/** TCP connect time in ms, or null when the address does not answer on that port. */
+function tcpLatency(host: string, port: number, timeoutMs: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    const t = Date.now();
+    const sock = connect({ host, port, timeout: timeoutMs });
+    const done = (ms: number | null) => { sock.destroy(); resolve(ms); };
+    sock.once('connect', () => done(Date.now() - t)).once('timeout', () => done(null)).once('error', () => done(null));
+  });
+}
+
+/**
+ * Addresses to try, best first. Several addresses: all are TCP-probed in parallel and the reachable ones are tried
+ * fastest first. Through a ProxyJump only the jump host can reach them, so the last working one goes first.
+ */
+async function addressOrder(row: HostRow, s: Settings) {
+  const p = profileOf(row);
+  const all = addressesOf(p);
+  if (all.length < 2 || p.mode !== 'direct') return { order: [null], latencies: undefined };
+  const current = connectProfile(row).address ?? p.hostname;
+  if (p.proxy_jump?.length) return { order: [current, ...all.filter((a) => a !== current)], latencies: undefined };
+  const ms = await Promise.all(all.map((a) => tcpLatency(a, p.port, s.connect_timeout_s * 1000)));
+  const latencies = all.map((address, i) => ({ address, latency_ms: ms[i] }));
+  const up = latencies.filter((l) => l.latency_ms !== null).sort((a, b) => a.latency_ms! - b.latency_ms!).map((l) => l.address);
+  return { order: up.length ? up : [current], latencies };
+}
+
+/** Failures that belong to one address (another network, or another machine on it), so the next address is worth a try. */
+const ADDRESS_FAILURES = ['CONNECTION_TIMEOUT', 'CONNECTION_REFUSED', 'NETWORK_UNREACHABLE', 'DNS_FAILED', 'HOST_KEY_CHANGED'];
+
 export async function checkHost(ctx: Ctx, raw: unknown) {
   const { host_id } = z.object({ host_id: z.uuid() }).strict().parse(raw);
   const row = getHostRow(ctx.db, host_id);
   const s = getSettings(ctx.db);
   const checkId = acquireCheckLease(ctx, row, 'connectivity', s);
   const started = Date.now();
-  let res: OsResult;
+  let res: OsResult | undefined;
+  let address: string | null = null;
+  let latencies: { address: string; latency_ms: number | null }[] | undefined;
   try {
-    res = await detectOs(ctx, row, s.check_timeout_s);
+    const plan = await addressOrder(row, s);
+    latencies = plan.latencies;
+    // Auth/trust failures are the same on every address: stop there instead of repeating a password attempt.
+    for (const a of plan.order) {
+      const r = await detectOs(ctx, { ...row, active_hostname: a }, s.check_timeout_s);
+      if (!res || r.ok) { res = r; address = a; }
+      if (r.ok || !ADDRESS_FAILURES.includes(classify(r.run).code)) break;
+    }
   } catch (e) {
     finishCheck(ctx, row, checkId, started, 'failure', 'INTERNAL_ERROR', { error: sanitize(String(e)) });
     throw e;
   }
+  res = res!;
+  const via = address === null ? {} : { address, ...(latencies ? { addresses: latencies } : {}) };
   const checked_at = now();
   if (res.ok) {
     const warnings = res.os === 'macos' ? macosSessionWarnings(res.out ?? '') : [];
-    const applied = finishCheck(ctx, row, checkId, started, 'success', null, { shell: res.shell, warnings }, res);
+    const applied = finishCheck(ctx, row, checkId, started, 'success', null, { shell: res.shell, warnings, ...via }, res);
+    if (applied && address !== null) ctx.db.prepare('UPDATE hosts SET active_hostname=? WHERE id=?').run(address, row.id);
     return {
-      success: true, check_id: checkId, host_id, checked_at, state: 'reachable', applied_to_current_profile: applied, warnings,
+      success: true, check_id: checkId, host_id, checked_at, state: 'reachable', applied_to_current_profile: applied, warnings, ...via,
       observed_os: res.os, observed_os_detail: res.detail, declared_os: row.declared_os,
       os_mismatch: row.declared_os !== 'unknown' && res.os !== 'unknown' && res.os !== row.declared_os,
       note: 'SSH login works. This says nothing about tools or devices; probe capabilities separately.',
@@ -127,9 +170,9 @@ export async function checkHost(ctx: Ctx, raw: unknown) {
   if (c.code === 'AUTH_REQUIRED') c.next_action = profileOf(row).auth === 'password'
     ? 'The host rejected the stored username/password. Ask the user to correct them in the SSH Resource Manager app (host → Edit). Never ask for the password in chat.'
     : 'Load the key into ssh-agent (ssh-add) or set identity_file on the host.';
-  const diag = diagnostics(res.run);
+  const diag = { ...diagnostics(res.run), ...via };
   const applied = finishCheck(ctx, row, checkId, started, 'failure', c.code, diag);
-  const candidates = c.code === 'TRUST_REQUIRED' ? await candidateFingerprints(ctx, profileOf(row)).catch((e) => ({ error: String(e.message ?? e) })) : undefined;
+  const candidates = c.code === 'TRUST_REQUIRED' ? await candidateFingerprints(ctx, connectProfile({ ...row, active_hostname: address })).catch((e) => ({ error: String(e.message ?? e) })) : undefined;
   return {
     success: false, check_id: checkId, host_id, checked_at, applied_to_current_profile: applied,
     error: { code: c.code, message: c.message, retryable: ['CONNECTION_TIMEOUT', 'NETWORK_UNREACHABLE', 'DNS_FAILED'].includes(c.code), next_action: c.next_action, diagnostics: diag },
@@ -163,7 +206,7 @@ function macosSessionWarnings(stdout: string): SessionWarning[] {
 
 type Candidate = { algorithm: string; fingerprint: string; bits: string; line: string };
 
-async function candidateFingerprints(ctx: Ctx, p: Profile): Promise<Candidate[]> {
+async function candidateFingerprints(ctx: Ctx, p: Profile & { address?: string }): Promise<Candidate[]> {
   if (p.mode !== 'direct') throw new AppError('PROBE_UNSUPPORTED', 'alias hosts use your own known_hosts; connect once in a terminal and verify the key there');
   const s = getSettings(ctx.db);
   // Capture the offered key with ssh itself (same KEX as real connections; Windows' ssh-keyscan 9.5
@@ -205,7 +248,7 @@ export async function approveHostKey(ctx: Ctx, raw: unknown) {
       });
     }
   }
-  const cands = await candidateFingerprints(ctx, p);
+  const cands = await candidateFingerprints(ctx, connectProfile(row));
   const match = cands.find((c) => c.fingerprint === input.fingerprint && c.algorithm.toUpperCase() === input.algorithm.toUpperCase());
   if (!match) throw new AppError('VALIDATION_ERROR', 'the host is not currently offering that fingerprint/algorithm', { details: { offered: cands.map(({ line: _l, ...c }) => c) } });
   appendFileSync(kh, match.line.trim() + '\n');
@@ -327,7 +370,7 @@ export function connectionRecipe(ctx: Ctx, raw: unknown) {
   }
   const host = getHost(ctx.db, input.host_id);
   const row = getHostRow(ctx.db, input.host_id);
-  const p = profileOf(row);
+  const p = connectProfile(row);
   const s = getSettings(ctx.db);
   const quote = env === 'windows-native' ? psQuote : posixQuote;
   const base = sshBaseArgs(p, ctx.dataDir, s, input.purpose === 'file_transfer', row.id);

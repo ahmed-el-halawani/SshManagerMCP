@@ -124,6 +124,10 @@ const MIGRATIONS: string[] = [
   ALTER TABLE hosts ADD COLUMN signing_mode TEXT NOT NULL DEFAULT 'off' CHECK(signing_mode IN ('off', 'login_keychain', 'build_keychain'));
   ALTER TABLE hosts ADD COLUMN signing_state_json TEXT;
   `,
+  // 7: hosts with several addresses (Wi-Fi/VPN): the one the last successful check picked
+  `
+  ALTER TABLE hosts ADD COLUMN active_hostname TEXT;
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

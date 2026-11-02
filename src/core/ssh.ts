@@ -80,7 +80,10 @@ export const knownHostsPath = (dataDir: string) => join(dataDir, 'known_hosts');
  * Common argv for both probes and agent recipes. Never disables host key checking.
  * Direct profiles use the app's own known_hosts; aliases keep the user's ssh_config semantics.
  */
-export function sshBaseArgs(p: Profile, dataDir: string, s: Settings, forScp = false, hostId = ''): { args: string[]; destination: string; env: Record<string, string> } {
+/** known_hosts name of a direct host's primary endpoint; every alternate address is checked against it. */
+export const hostKeyAlias = (p: { hostname: string; port: number }) => (p.port === 22 ? p.hostname : `[${p.hostname}]:${p.port}`);
+
+export function sshBaseArgs(p: Profile & { address?: string }, dataDir: string, s: Settings, forScp = false, hostId = ''): { args: string[]; destination: string; env: Record<string, string> } {
   const password = p.auth === 'password';
   // Password hosts: BatchMode must be off for askpass, but the answer comes only from our helper
   // (SSH_ASKPASS_REQUIRE=force), never a TTY, so nothing can hang waiting for input.
@@ -96,11 +99,13 @@ export function sshBaseArgs(p: Profile, dataDir: string, s: Settings, forScp = f
   if (p.identity_file) args.push('-i', p.identity_file);
   if (p.identities_only) args.push('-o', 'IdentitiesOnly=yes');
   if (p.proxy_jump?.length) args.push('-J', p.proxy_jump.join(','));
+  // Same machine on another network: a different machine answering on that address fails the key check.
+  if (p.alternate_hostnames?.length) args.push('-o', `HostKeyAlias=${hostKeyAlias(p)}`);
   args.push(forScp ? '-P' : '-p', String(p.port), '-o', `User=${p.username}`);
-  return { args, destination: p.hostname, env };
+  return { args, destination: p.address ?? p.hostname, env };
 }
 
-export function sshArgs(p: Profile, dataDir: string, s: Settings, remoteCommand: string, hostId: string): { args: string[]; env: Record<string, string> } {
+export function sshArgs(p: Profile & { address?: string }, dataDir: string, s: Settings, remoteCommand: string, hostId: string): { args: string[]; env: Record<string, string> } {
   const { args, destination, env } = sshBaseArgs(p, dataDir, s, false, hostId);
   return { args: [...args, '-T', '--', destination, remoteCommand], env };
 }

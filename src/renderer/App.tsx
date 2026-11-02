@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { age, call, CallError, checkHost, copy, errText, idem } from './api.ts';
 
 type Status = { state: string; checked_at: string | null; stale: boolean; error_code: string | null };
-type HostSummary = { id: string; name: string; enabled: boolean; target: string; declared_os: string; observed_os: string | null; os_mismatch: boolean; tags: string[]; revision: number; status: Status; capability_keys: string[] };
+type HostSummary = { id: string; name: string; enabled: boolean; target: string; active_address?: string; declared_os: string; observed_os: string | null; os_mismatch: boolean; tags: string[]; revision: number; status: Status; capability_keys: string[] };
 
 function usePoll<T>(fn: () => Promise<T>, deps: unknown[], ms = 2000) {
   const [data, setData] = useState<T | null>(null);
@@ -284,7 +284,7 @@ function HostList({ onOpen, onAdd, onEdit }: { onOpen: (id: string) => void; onA
                   <div className="id">{h.id.slice(0, 8)}</div>
                 </td>
                 <td>{h.declared_os} / {h.observed_os ?? '—'} {h.os_mismatch && <span className="badge warn">mismatch</span>}</td>
-                <td className="mono">{h.target}</td>
+                <td className="mono">{h.target}{h.active_address && <span className="muted"> → {h.active_address}</span>}</td>
                 <td><Badge s={h.status} /></td>
                 <td>{h.capability_keys.slice(0, 4).join(', ')}{h.capability_keys.length > 4 ? ` +${h.capability_keys.length - 4}` : ''}</td>
                 <td style={{ textAlign: 'center' }} onClick={(e) => e.stopPropagation()}>
@@ -470,10 +470,10 @@ function HostList({ onOpen, onAdd, onEdit }: { onOpen: (id: string) => void; onA
 // ═══════════════════════════════════════════════════════════
 
 type FormState = {
-  mode: 'direct' | 'ssh_alias'; auth: 'key' | 'password'; password: string; hostname: string; port: string; username: string; identity_file: string; identities_only: boolean; proxy_jump: string;
+  mode: 'direct' | 'ssh_alias'; auth: 'key' | 'password'; password: string; hostname: string; alternates: string; port: string; username: string; identity_file: string; identities_only: boolean; proxy_jump: string;
   alias: string; config_path: string; name: string; declared_os: string; description: string; instructions: string; tags: string; default_remote_directory: string; caps: string; enabled: boolean;
 };
-const emptyForm: FormState = { mode: 'direct', auth: 'key', password: '', hostname: '', port: '22', username: '', identity_file: '', identities_only: false, proxy_jump: '', alias: '', config_path: '',
+const emptyForm: FormState = { mode: 'direct', auth: 'key', password: '', hostname: '', alternates: '', port: '22', username: '', identity_file: '', identities_only: false, proxy_jump: '', alias: '', config_path: '',
   name: '', declared_os: 'unknown', description: '', instructions: '', tags: '', default_remote_directory: '', caps: '', enabled: true };
 
 function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: string | null) => void }) {
@@ -492,7 +492,7 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
     if (!hostId) return;
     const h = await call('getHost', { host_id: hostId });
     const p = h.profile;
-    setF({ ...emptyForm, mode: p.mode, auth: p.auth ?? 'key', hostname: p.hostname ?? '', port: String(p.port ?? 22), username: p.username ?? '', identity_file: p.identity_file ?? '',
+    setF({ ...emptyForm, mode: p.mode, auth: p.auth ?? 'key', hostname: p.hostname ?? '', alternates: (p.alternate_hostnames ?? []).join(', '), port: String(p.port ?? 22), username: p.username ?? '', identity_file: p.identity_file ?? '',
       identities_only: !!p.identities_only, proxy_jump: (p.proxy_jump ?? []).join(','), alias: p.alias ?? '', config_path: p.config_path ?? '',
       name: h.name, declared_os: h.declared_os, description: h.description, instructions: h.instructions, tags: h.tags.join(', '),
       default_remote_directory: h.default_remote_directory ?? '', enabled: h.enabled,
@@ -511,6 +511,7 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
   const profile = () => f.mode === 'ssh_alias'
     ? { mode: 'ssh_alias', alias: f.alias.trim(), auth: f.auth, ...(f.config_path ? { config_path: f.config_path } : {}) }
     : { mode: 'direct', hostname: f.hostname.trim(), port: Number(f.port), username: f.username.trim(), auth: f.auth, identities_only: f.identities_only,
+      ...(f.alternates.trim() ? { alternate_hostnames: f.alternates.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
       ...(f.identity_file ? { identity_file: f.identity_file } : {}), ...(f.proxy_jump ? { proxy_jump: f.proxy_jump.split(',').map((s) => s.trim()).filter(Boolean) } : {}),
       ...(f.config_path ? { config_path: f.config_path } : {}) };
   const caps = () => f.caps.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => { const [k, ...rest] = l.split('|'); return { key: k.trim(), label: rest.join('|').trim() }; });
@@ -585,6 +586,7 @@ function HostForm({ hostId, onDone }: { hostId: string | null; onDone: (id: stri
         {f.mode === 'direct' ? (
           <div className="grid">
             <L t="Hostname / IP"><input value={f.hostname} onChange={set('hostname')} /></L>
+            <L t="Other addresses of this machine (Wi-Fi, VPN; comma separated). Check uses the fastest that answers."><input value={f.alternates} onChange={set('alternates')} placeholder="10.8.0.5, 192.168.50.20" /></L>
             <L t="Port"><input value={f.port} onChange={set('port')} inputMode="numeric" /></L>
             <L t="Username"><input value={f.username} onChange={set('username')} /></L>
             <L t="Identity file (optional)"><input value={f.identity_file} onChange={set('identity_file')} /></L>

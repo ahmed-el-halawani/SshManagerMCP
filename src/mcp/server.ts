@@ -85,7 +85,7 @@ tool('ssh_hosts_get', 'Full host details: profile, description, instructions, de
 tool('ssh_hosts_history', 'Recent check history for a host (bounded diagnostics).',
   z.object({ host_id: uuid, limit: z.number().int().min(1).max(100).optional() }), RO, (i) => core.hostHistory(i));
 
-tool('ssh_hosts_check', 'Run a bounded, read-only SSH connectivity + OS check (BatchMode, timeouts). Failure never deletes the host. On TRUST_REQUIRED returns unverified candidate fingerprints.',
+tool('ssh_hosts_check', 'Run a bounded, read-only SSH connectivity + OS check (BatchMode, timeouts). Failure never deletes the host. On TRUST_REQUIRED returns unverified candidate fingerprints. Hosts with alternate_hostnames (other Wi-Fi/VPN addresses): tries all, keeps the fastest that works; recipes then use it, so re-fetch recipes after a check.',
   z.object({ host_id: uuid }), RO_NET, (i) => core.checkHost(i));
 
 tool('ssh_hosts_probe_capabilities', 'Run built-in read-only probes: "macos.xcode" or "binary:<name>" (e.g. binary:git). Declared capability is not proof; this is.',
