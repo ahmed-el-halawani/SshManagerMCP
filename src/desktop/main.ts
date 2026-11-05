@@ -17,7 +17,7 @@ const log = createLogger(core.dataDir, 'gui');
 // Only these core methods are reachable from the renderer. No shell/exec channel exists.
 const ALLOWED = new Set(['parseConnectionInput', 'registerHost', 'updateHost', 'duplicateHost', 'listHosts', 'getHost', 'removeHost', 'checkHost', 'probeCapabilities',
   'approveHostKey', 'connectionRecipe', 'setHostPassword', 'clearHostPassword', 'switchToKeyAuth','setSigningMode', 'setupBuildKeychain', 'listRemoteDir', 'hostHistory', 'registerProject', 'listProjects', 'getProject', 'removeProject', 'bindProjectLocation',
-  'updateProjectLocation', 'unbindProjectLocation', 'inspectProject', 'findProjectOnHost', 'preflightProject', 'syncProject', 'getSettings', 'setSettings', 'environment']);
+  'updateProjectLocation', 'unbindProjectLocation', 'inspectProject', 'findProjectOnHost', 'preflightProject', 'syncProject', 'syncHistory', 'diffProjectFile', 'getSettings', 'setSettings', 'environment']);
 
 ipcMain.handle('core', async (_e, method: string, arg: unknown) => {
   if (!ALLOWED.has(method)) return { ok: false, error: { code: 'VALIDATION_ERROR', message: `unknown method ${method}` } };
@@ -78,6 +78,13 @@ ipcMain.handle('backup', async () => {
 });
 
 ipcMain.handle('open-data-dir', () => shell.openPath(core.dataDir));
+// Toolbar actions of the Projects view: a local folder in Explorer, or a folder in VS Code (local or Remote-SSH alias).
+ipcMain.handle('show-folder', (_e, path: string) => (existsSync(String(path)) ? shell.openPath(String(path)) : 'missing'));
+ipcMain.handle('open-in-vscode', (_e, path: string, sshAlias?: string) => {
+  const p = String(path).replaceAll('\\', '/');
+  if (sshAlias && !/^[\w.-]+$/.test(sshAlias)) return false;
+  return shell.openExternal(sshAlias ? `vscode://vscode-remote/ssh-remote+${sshAlias}${p.startsWith('/') ? '' : '/'}${encodeURI(p)}` : `vscode://file/${encodeURI(p)}`).then(() => true, () => false);
+});
 
 ipcMain.handle('copy-text', (_e, text: string) => {
   clipboard.writeText(String(text ?? ''));

@@ -13,5 +13,7 @@ contextBridge.exposeInMainWorld('api', {
   importApply: () => ipcRenderer.invoke('import-apply'),
   backup: () => ipcRenderer.invoke('backup'),
   openDataDir: () => ipcRenderer.invoke('open-data-dir'),
+  showFolder: (path: string) => ipcRenderer.invoke('show-folder', path),
+  openInVscode: (path: string, sshAlias?: string) => ipcRenderer.invoke('open-in-vscode', path, sshAlias),
   copyText: (text: string) => ipcRenderer.invoke('copy-text', text),
 });

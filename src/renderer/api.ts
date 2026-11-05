@@ -16,6 +16,8 @@ declare global {
       backup: () => Promise<string | null>;
       openDataDir: () => Promise<string>;
       copyText: (text: string) => Promise<boolean>;
+      showFolder: (path: string) => Promise<string>;
+      openInVscode: (path: string, sshAlias?: string) => Promise<boolean>;
     };
   }
 }

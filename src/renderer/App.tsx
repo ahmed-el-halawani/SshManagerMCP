@@ -34,50 +34,415 @@ const Err = ({ e }: { e: string | null }) => (e ? <div className="error">{e}</di
 // ═══════════════════════════════════════════════════════════
 
 export function App() {
-  const [tab, setTab] = useState<'hosts' | 'setup'>('hosts');
+  const [tab, setTab] = useState<'projects' | 'hosts' | 'setup'>(() => (store.get('view') as 'projects' | 'hosts' | 'setup' | null) ?? 'projects');
   const [hostId, setHostId] = useState<string | null>(null);
   const [editing, setEditing] = useState<'new' | string | null>(null);
   const { data: hostsData } = usePoll(() => call<{ hosts: HostSummary[] }>('listHosts', { limit: 100 }), [], 3000);
 
   const hostCount = hostsData?.hosts.length ?? 0;
   const onlineCount = hostsData?.hosts.filter(h => h.status.state === 'reachable').length ?? 0;
+  const go = (t: typeof tab) => { setTab(t); store.set('view', t); setHostId(null); setEditing(null); };
 
   return (
     <div className="app">
-      {/* ── Sidebar ─────────────────────────────────────────── */}
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <div className="brand-icon">⌘</div>
-          <div>
-            <div className="brand-text">SSH Manager</div>
-            <div className="brand-sub">Resource Control</div>
+      {/* ── Menu bar (GitHub Desktop's File/Edit/View row) ───── */}
+      <nav className="gd-menubar">
+        <span className="gd-logo">⌘</span>
+        {(['projects', 'hosts', 'setup'] as const).map((t) => (
+          <button key={t} className={tab === t ? 'active' : ''} onClick={() => go(t)}>{t[0].toUpperCase() + t.slice(1)}</button>
+        ))}
+        <span className="grow-1" />
+        <span className="gd-menubar-status"><span className={`badge-dot ${onlineCount ? 'dot-ok' : 'dot-muted'}`} /> {onlineCount}/{hostCount} hosts online</span>
+      </nav>
+
+      {tab === 'projects' ? <ProjectsView hosts={hostsData?.hosts ?? []} onOpenHost={(id) => { setTab('hosts'); setHostId(id); }} /> : (
+        <div className="content-area">
+          {tab === 'hosts' && editing && <HostForm hostId={editing === 'new' ? null : editing} onDone={(id) => { setEditing(null); if (id) setHostId(id); }} />}
+          {tab === 'hosts' && !editing && hostId && <HostDetail id={hostId} onBack={() => setHostId(null)} onEdit={() => setEditing(hostId)} />}
+          {tab === 'hosts' && !editing && !hostId && <HostList onOpen={setHostId} onAdd={() => setEditing('new')} onEdit={(id) => setEditing(id)} />}
+          {tab === 'setup' && <Setup />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Per-viewer UI memory (last view/project/destination). Storage can be blocked: never required. */
+const store = {
+  get: (k: string) => { try { return localStorage.getItem(`sshrm.${k}`); } catch { return null; } },
+  set: (k: string, v: string) => { try { localStorage.setItem(`sshrm.${k}`, v); } catch { /* not persisted */ } },
+};
+
+// ═══════════════════════════════════════════════════════════
+// Projects workspace (laid out like GitHub Desktop)
+//   Current repository → project · Current worktree → destination (host + folder)
+//   Current branch → source branch · Fetch origin → Check host (preflight)
+//   Changes / History → what Sync would send / past verified syncs · Commit to main → Sync to <host>
+// ═══════════════════════════════════════════════════════════
+
+function ToolbarItem({ icon, label, value, sub, open, onClick, disabled }: { icon: string; label: string; value: ReactNode; sub?: ReactNode; open?: boolean; onClick?: () => void; disabled?: boolean }) {
+  return (
+    <button className={`gd-tb ${open ? 'open' : ''} ${onClick ? '' : 'static'}`} onClick={onClick} disabled={disabled} tabIndex={onClick ? 0 : -1}>
+      <span className="gd-tb-icon">{icon}</span>
+      <span className="gd-tb-text">{label && <span className="gd-tb-label">{label}</span>}<span className="gd-tb-value">{value}</span>{sub && <span className="gd-tb-label">{sub}</span>}</span>
+      {open !== undefined && <span className="gd-tb-caret">{open ? '▴' : '▾'}</span>}
+    </button>
+  );
+}
+
+const OUTCOME: Record<string, { icon: string; cls: string; text: string }> = {
+  verified: { icon: '✓', cls: 'ok', text: 'Verified' }, failed: { icon: '✕', cls: 'bad', text: 'Failed' },
+  partial: { icon: '◐', cls: 'warn', text: 'Partial' }, needs_recheck: { icon: '↻', cls: 'warn', text: 'Needs recheck' },
+};
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost: (id: string) => void }) {
+  const { data, reload } = usePoll(() => call('listProjects', {}), [], 3000);
+  const projects: any[] = data?.projects ?? [];
+  const [pid, setPid] = useState(() => store.get('project'));
+  const [did, setDid] = useState(() => store.get('dest'));
+  const [menu, setMenu] = useState<'project' | 'dest' | null>(null);
+  const [filter, setFilter] = useState('');
+  const [tab, setTab] = useState<'changes' | 'history'>('changes');
+  const [pre, setPre] = useState<any>(null);
+  const [checkedAt, setCheckedAt] = useState<string | null>(null);
+  const [busy, setBusy] = useState<'check' | 'sync' | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [adding, setAdding] = useState<string | null>(null); // host id for the New mapping dialog ('' = pick one)
+  const [selSync, setSelSync] = useState<string | null>(null);
+  const [selFile, setSelFile] = useState<string | null>(null);
+  const [show, setShow] = useState<'all' | 'dirty' | 'clean'>('all');
+  const [sideW, setSideW] = useState(() => Number(store.get('sideW')) || 260);
+  const seq = useRef(0);
+  // Drag the sidebar's right edge (double-click resets). The project toolbar item follows the same width, like GitHub Desktop.
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const x0 = e.clientX; const w0 = sideW; let w = w0;
+    const move = (ev: MouseEvent) => { w = Math.min(720, Math.max(200, w0 + ev.clientX - x0)); setSideW(w); };
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); document.body.classList.remove('resizing'); store.set('sideW', String(w)); };
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up); document.body.classList.add('resizing');
+  };
+
+  const project = projects.find((p) => p.id === pid) ?? projects[0];
+  const dests: any[] = project?.locations.filter((l: any) => l.role !== 'source') ?? [];
+  const dest = dests.find((l) => l.id === did) ?? dests[0];
+  const source = project?.locations.find((l: any) => l.id === (dest?.source_location_id ?? project.source_location_id));
+  const host = hosts.find((h) => h.id === dest?.host_id);
+  const hist = usePoll(() => (dest ? call('syncHistory', { destination_location_id: dest.id, limit: 50 }) : Promise.resolve({ syncs: [] })), [dest?.id], 10_000);
+  const syncs: any[] = hist.data?.syncs ?? [];
+  const exec = pre?.suggested_plan.exec;
+  const hostName = host?.name ?? 'host';
+
+  const check = async () => {
+    if (!project || !dest) return;
+    const n = ++seq.current;
+    setBusy('check'); setErr(null);
+    try {
+      const r = await call('preflightProject', { project_id: project.id, destination_location_id: dest.id, intent: 'transfer', detail: 'full' });
+      if (n === seq.current) { setPre(r); setCheckedAt(new Date().toISOString()); }
+    } catch (e) { if (n === seq.current) { setPre(null); setErr(errText(e)); } } finally { if (n === seq.current) setBusy(null); }
+  };
+  // Like GitHub Desktop fetching on open: picking a destination checks it (read-only over SSH).
+  useEffect(() => { setPre(null); setNote(null); setErr(null); setSelSync(null); setSelFile(null); setCheckedAt(null); if (dest?.path_input) check(); }, [project?.id, dest?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const sync = async () => {
+    setBusy('sync'); setErr(null); setNote(null);
+    try {
+      const r = await call('syncProject', { project_id: project.id, destination_location_id: dest.id });
+      setNote(`${OUTCOME[r.outcome]?.text ?? r.outcome}: ${r.note}`);
+      hist.reload(); reload();
+      await check();
+    } catch (e) { setErr(errText(e)); setBusy(null); }
+  };
+
+  const pickProject = (id: string) => { setPid(id); store.set('project', id); setMenu(null); setFilter(''); };
+  const pickDest = (id: string) => { setDid(id); store.set('dest', id); setMenu(null); };
+
+  // Changes list: every file that differs between this PC and the host. "Dirty" = the host's own work is on it
+  // (uncommitted there, or in a commit made there): Sync never overwrites those.
+  const allRows: FileRow[] = (pre?.files ?? []).map((f: any) => ({
+    p: f.path, m: f.status === 'modified' ? 'M' : f.status === 'added' ? 'A' : 'D', dirty: f.host_dirty || f.host_committed,
+    t: [f.status === 'modified' ? `differs from ${hostName}` : f.status === 'added' ? `not on ${hostName} yet` : `only on ${hostName}`,
+      f.host_dirty && `changed on ${hostName} and not committed there`, f.host_committed && `changed in a commit made on ${hostName}`,
+      f.conflict && 'also changed on this PC (conflict)'].filter(Boolean).join(' · '),
+  }));
+  const dirtyCount = allRows.filter((r) => r.dirty).length;
+  const rows = show === 'dirty' ? allRows.filter((r) => r.dirty) : show === 'clean' ? allRows.filter((r) => !r.dirty) : allRows;
+  const selRow = allRows.find((r) => r.p === selFile);
+  const kind = pre?.suggested_plan.kind as string | undefined;
+  const commitStep: string | undefined = exec && kind ? ({ git_clone: 'Clone', git_switch: 'Switch to', git_fast_forward: 'Fast-forward' } as Record<string, string>)[kind] : undefined;
+  const commitLine = commitStep && `${commitStep} ${exec.branch ?? ''}`.trim();
+  const changeCount = allRows.length + (commitLine ? 1 : 0);
+  const branch = pre?.summary.source.branch ?? source?.last_inspection?.branch ?? '—';
+  const destPath = pre?.summary.destination.path ?? dest?.canonical_path ?? dest?.path_input;
+  const srcPath = source?.canonical_path ?? source?.path_input;
+  const selected = syncs.find((s) => s.id === selSync);
+  const dialog = adding !== null && <MappingDialog hosts={hosts} hostId={adding} projects={projects} onClose={() => { setAdding(null); reload(); }} />;
+
+  if (data && projects.length === 0) {
+    return (
+      <div className="gd-body"><main className="gd-main"><div className="gd-blank">
+        <h1>No projects yet</h1>
+        <p>Map a project folder on this PC to a folder on one of your hosts, then check and sync it from here.</p>
+        <div className="gd-box"><div className="gd-row"><div><b>Add your first project mapping</b><div className="muted small">A mapping never copies anything until you press Sync.</div></div>
+          <button className="primary" onClick={() => setAdding('')} disabled={!hosts.length}>New mapping</button></div></div>
+        {!hosts.length && <p className="muted small">Add a host first (Hosts menu).</p>}
+      </div></main>{dialog}</div>
+    );
+  }
+
+  return (
+    <div className="gd-body" style={{ '--side-w': `${sideW}px` } as React.CSSProperties}>
+      {/* ── Toolbar ─────────────────────────────────────────── */}
+      <div className="gd-toolbar">
+        <ToolbarItem icon="▣" label="Current project" value={project?.name ?? '…'} open={menu === 'project'} onClick={() => setMenu(menu === 'project' ? null : 'project')} />
+        <ToolbarItem icon="🖥" label="Current destination" value={dest ? `${hostName}${dest.label && dest.label !== host?.name ? ` · ${dest.label}` : ''}` : 'None'} open={menu === 'dest'} onClick={() => setMenu(menu === 'dest' ? null : 'dest')} />
+        <ToolbarItem icon="⑂" label="Current branch" value={branch} />
+        <ToolbarItem icon={busy === 'check' ? '◌' : '⟳'} label="" value={busy === 'check' ? `Checking ${hostName}…` : `Check ${hostName}`} sub={checkedAt ? `Last checked ${age(checkedAt)}` : 'Not checked yet'}
+          onClick={check} disabled={!!busy || !dest?.path_input} />
+        {menu && <div className="gd-scrim" onClick={() => setMenu(null)} />}
+        {menu === 'project' && (
+          <div className="gd-pop" style={{ left: 0 }}>
+            <div className="gd-pop-head"><input autoFocus placeholder="Filter" value={filter} onChange={(e) => setFilter(e.target.value)} /><button onClick={() => { setMenu(null); setAdding(''); }}>New mapping</button></div>
+            <div className="gd-pop-section">Projects</div>
+            {projects.filter((p) => p.name.toLowerCase().includes(filter.toLowerCase())).map((p) => (
+              <button key={p.id} className="gd-pop-item" onClick={() => pickProject(p.id)}>
+                <span className="gd-check">{p.id === project?.id ? '✓' : ''}</span><span className="grow-1 ellipsis">{p.name}</span>
+                <span className="muted small">{plural(p.locations.filter((l: any) => l.role !== 'source').length, 'host')}</span>
+              </button>
+            ))}
           </div>
-        </div>
+        )}
+        {menu === 'dest' && (
+          <div className="gd-pop" style={{ left: 'var(--side-w)' }}>
+            <div className="gd-pop-head"><span className="grow-1 muted small ellipsis">{project?.name}</span><button onClick={() => { setMenu(null); setAdding(''); }}>New mapping</button></div>
+            <div className="gd-pop-section">Source</div>
+            <div className="gd-pop-item static"><span className="gd-check">💻</span><span className="grow-1">This PC</span><span className="muted small mono ellipsis">{srcPath}</span></div>
+            <div className="gd-pop-section">Destinations</div>
+            {dests.length === 0 && <div className="gd-pop-item static muted">Not mapped to any host yet.</div>}
+            {dests.map((l) => {
+              const h = hosts.find((x) => x.id === l.host_id);
+              return (
+                <button key={l.id} className="gd-pop-item" onClick={() => pickDest(l.id)}>
+                  <span className="gd-check">{l.id === dest?.id ? '✓' : ''}</span>
+                  {h && <StatusDot s={h.status} />}
+                  <span className="grow-1 ellipsis">{h?.name ?? 'unknown host'}{l.label && l.label !== h?.name ? ` · ${l.label}` : ''}</span>
+                  <span className="muted small mono ellipsis">{l.path_input ?? 'folder not set'}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
-        <nav className="sidebar-nav">
-          <button className={tab === 'hosts' ? 'active' : ''} onClick={() => { setTab('hosts'); setHostId(null); setEditing(null); }}>
-            <span className="nav-icon">🖥</span>
-            Hosts
-            {hostCount > 0 && <span className="nav-count">{hostCount}</span>}
-          </button>
-          <button className={tab === 'setup' ? 'active' : ''} onClick={() => { setTab('setup'); setHostId(null); setEditing(null); }}>
-            <span className="nav-icon">⚙</span>
-            Setup
-          </button>
-        </nav>
+      <div className="gd-split">
+        {/* ── Sidebar: Changes / History ───────────────────── */}
+        <aside className="gd-side">
+          <div className="gd-tabs">
+            <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>Changes{changeCount ? <span className="gd-count">{changeCount}</span> : null}</button>
+            <button className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>History</button>
+          </div>
+          {tab === 'changes' ? (
+            <>
+              <div className="gd-list-head">{pre ? plural(allRows.length, 'changed file') : busy === 'check' ? 'Checking…' : 'Not checked yet'}</div>
+              {pre && allRows.length > 0 && (
+                <div className="gd-seg" role="radiogroup" aria-label="Show files">
+                  {([['all', 'All', allRows.length, 'Every file that differs'], ['dirty', 'Dirty', dirtyCount, `Changed on ${hostName} itself: Sync won't overwrite these`],
+                    ['clean', 'Not dirty', allRows.length - dirtyCount, `Only changed on this PC: safe to sync`]] as const).map(([k, label, n, tip]) => (
+                    <button key={k} role="radio" aria-checked={show === k} className={show === k ? 'on' : ''} title={tip} onClick={() => setShow(k)}>{label} <span className="gd-seg-n">{n}</span></button>
+                  ))}
+                </div>
+              )}
+              <div className="gd-list">
+                {commitLine && <div className="gd-file commit" title={`${pre.summary.source.head} → ${hostName}`}><span className="grow-1 ellipsis">⊶ {commitLine} → {pre.summary.source.head?.slice(0, 7)}</span><span className="gd-mark A">⇡</span></div>}
+                {rows.map((r) => (
+                  <button key={r.p} className={`gd-file ${r.p === selFile ? 'sel' : ''}`} title={`${r.p}\n${r.t}`} onClick={() => setSelFile(r.p)}>
+                    <span className="gd-path"><span className="gd-dir">{r.p.slice(0, r.p.lastIndexOf('/') + 1)}</span><span className="gd-name">{r.p.slice(r.p.lastIndexOf('/') + 1)}</span></span>
+                    {r.dirty && <span className="gd-mark dirty" title={`Dirty: changed on ${hostName}`}>!</span>}
+                    <span className={`gd-mark ${r.m}`}>{r.m === 'M' ? '•' : r.m === 'A' ? '+' : '−'}</span>
+                  </button>
+                ))}
+                {pre && allRows.length > 0 && rows.length === 0 && <div className="gd-list-empty">No {show === 'dirty' ? 'dirty' : 'clean'} files.</div>}
+              </div>
+              {/* GitHub Desktop's commit box → the sync box */}
+              <div className="gd-commit">
+                <div className="gd-commit-sum">{exec ? [commitLine, exec.copy.length ? plural(exec.copy.length, 'uncommitted file') : ''].filter(Boolean).join(' + ') : pre ? (pre.verdict === 'ready' ? 'Already in sync' : 'Sync now can’t run this safely') : 'Check the host first'}</div>
+                <div className="gd-commit-desc">{pre ? <>This PC <b>{pre.summary.source.branch ?? 'no git'}</b> {pre.summary.source.head?.slice(0, 7)} → {hostName} <b>{pre.summary.destination.branch ?? (pre.summary.destination.head ? 'detached' : 'no git')}</b> {pre.summary.destination.head?.slice(0, 7)}</> : <span className="muted">Fast-forward only. Work on the host is never overwritten.</span>}</div>
+                <button className="primary gd-wide" disabled={!exec || !!busy} onClick={sync} title="Runs the plan over SSH, then re-reads both sides to verify">
+                  {busy === 'sync' ? 'Syncing…' : <>Sync to <b>{hostName}</b></>}
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="gd-list">
+              {syncs.length === 0 && <div className="gd-list-head">No syncs recorded yet</div>}
+              {syncs.map((s) => {
+                const o = OUTCOME[s.outcome] ?? { icon: '?', cls: '', text: s.outcome };
+                return (
+                  <button key={s.id} className={`gd-hist ${s.id === selSync ? 'sel' : ''}`} onClick={() => setSelSync(s.id)}>
+                    <span className="gd-hist-title ellipsis"><span className={`gd-oc ${o.cls}`}>{o.icon}</span> {s.transfer_mode === 'gui_sync' ? 'Sync now' : s.transfer_mode ? `Transfer (${s.transfer_mode})` : 'Agent transfer'}{s.branch ? ` · ${s.branch}` : ''}</span>
+                    <span className="gd-hist-sub">{s.head ? `${s.head.slice(0, 7)} · ` : ''}{o.text} · {age(s.started_at)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </aside>
+        <div className="gd-resize" onMouseDown={startResize} onDoubleClick={() => { setSideW(260); store.set('sideW', '260'); }} title="Drag to resize · double-click to reset" />
 
-        <div className="sidebar-footer">
-          <div className="version">SSH Resource Manager v1.0</div>
-          <div className="version">{onlineCount}/{hostCount} hosts online</div>
-        </div>
-      </aside>
+        {/* ── Main pane ────────────────────────────────────── */}
+        <main className="gd-main">
+          {tab === 'changes' && selRow ? (
+            <FileDiff key={selRow.p} projectId={project.id} destId={dest.id} row={selRow} hostName={hostName} onClose={() => setSelFile(null)} />
+          ) : tab === 'history' ? (
+            selected ? <SyncDetail s={selected} /> : <div className="gd-blank"><h1>History</h1><p className="muted">Every verification after a transfer to {hostName} is listed on the left: the commit it was checked against and whether both sides matched.</p></div>
+          ) : (
+            <div className="gd-blank">
+              <Err e={err} />
+              {note && <div className="success">✓ {note}</div>}
+              {!dest ? (
+                <><h1>Not mapped yet</h1><p>{project?.name} has no destination host.</p>
+                  <div className="gd-box"><div className="gd-row"><div><b>Map this project to a host</b><div className="muted small">Pick a host and a folder on it.</div></div><button onClick={() => setAdding('')}>New mapping</button></div></div></>
+              ) : !dest.path_input ? (
+                <><h1>No destination folder</h1><p>The folder on {hostName} is not set yet.</p>
+                  <div className="gd-box"><div className="gd-row"><div><b>Choose the folder on {hostName}</b><div className="muted small">Edit the mapping on the host page.</div></div><button onClick={() => onOpenHost(dest.host_id)}>Open {hostName}</button></div></div></>
+              ) : (
+                <>
+                  <h1>{!pre ? (busy === 'check' ? `Checking ${hostName}…` : 'Not checked yet') : exec ? `${plural(changeCount, 'change')} ready to sync` : pre.verdict === 'ready' ? 'No changes to sync' : 'Sync is blocked'}</h1>
+                  <p>{!pre ? 'Reads both folders over SSH. Nothing is changed.' : pre.verdict === 'ready' && !exec ? `${hostName} matches this PC (${pre.summary.source.branch ?? 'no branch'} ${pre.summary.source.head?.slice(0, 7) ?? ''}). Here are some friendly suggestions for what to do next.` : exec ? `Sync carries this PC's work to ${hostName}, then re-reads both sides to verify.` : `${hostName} has work that Sync won't overwrite.`}</p>
+                  {exec && (
+                    <div className="gd-box blue"><div className="gd-row"><div><b>Sync your changes to {hostName}</b><div>{commitLine ? `${commitLine}${exec.copy.length ? ` and copy ${plural(exec.copy.length, 'uncommitted file')}` : ''}.` : `Copy ${plural(exec.copy.length, 'file')}.`}</div>
+                      <div className="muted small">Fast-forward only: if {hostName} has its own commits or edits, Git refuses and nothing is overwritten.</div></div>
+                      <button className="primary" disabled={!!busy} onClick={sync}>{busy === 'sync' ? 'Syncing…' : 'Sync now'}</button></div></div>
+                  )}
+                  {pre && !exec && pre.verdict !== 'ready' && (
+                    <div className="gd-box amber">
+                      <b>Why it can't sync: {pre.verdict.replaceAll('_', ' ')}</b>
+                      <ul>{pre.facts.filter((f: any) => f.blocking).map((f: any, i: number) => <li key={i}>{f.detail}</li>)}</ul>
+                      <div className="muted small">Resolve it on {hostName} (commit or discard the work there), then check again. Your AI agent can also follow the plan below.</div>
+                    </div>
+                  )}
+                  <div className="gd-box list">
+                    <div className="gd-row"><div><b>Open the project in your external editor</b><div className="muted small mono ellipsis">{srcPath}</div></div><button onClick={() => window.api.openInVscode(srcPath)}>Open in Visual Studio Code</button></div>
+                    <div className="gd-row"><div><b>View the files of your project in Explorer</b></div><button onClick={() => window.api.showFolder(srcPath)}>Show in Explorer</button></div>
+                    <div className="gd-row"><div><b>Open the folder on {hostName}</b><div className="muted small mono ellipsis">{destPath}</div></div><HostOpenButton hostId={dest.host_id} path={destPath} /></div>
+                    <div className="gd-row"><div><b>Manage this mapping</b><div className="muted small">Change folders, confirm identity or remove it on the host page.</div></div><button onClick={() => onOpenHost(dest.host_id)}>Open {hostName}</button></div>
+                  </div>
+                  {pre && (
+                    <details className="gd-plan">
+                      <summary>Plan for agents ({kind?.replaceAll('_', ' ')}) · source snapshot {pre.source_snapshot}</summary>
+                      <ol className="small">{pre.suggested_plan.steps.map((s: string, i: number) => <li key={i}>{s}</li>)}</ol>
+                    </details>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </main>
+      </div>
+      {dialog}
+    </div>
+  );
+}
 
-      {/* ── Content ────────────────────────────────────────── */}
-      <div className="content-area">
-        {tab === 'hosts' && editing && <HostForm hostId={editing === 'new' ? null : editing} onDone={(id) => { setEditing(null); if (id) setHostId(id); }} />}
-        {tab === 'hosts' && !editing && hostId && <HostDetail id={hostId} onBack={() => setHostId(null)} onEdit={() => setEditing(hostId)} />}
-        {tab === 'hosts' && !editing && !hostId && <HostList onOpen={setHostId} onAdd={() => setEditing('new')} onEdit={(id) => setEditing(id)} />}
-        {tab === 'setup' && <Setup />}
+type FileRow = { p: string; m: 'M' | 'A' | 'D'; dirty: boolean; t: string };
+type DiffLine = { k: 'hunk' | 'add' | 'del' | 'ctx'; o?: number; n?: number; t: string };
+
+function parseDiff(diff: string): DiffLine[] {
+  const out: DiffLine[] = [];
+  let o = 0; let n = 0;
+  for (const l of diff.split('\n')) {
+    if (l.startsWith('@@')) { const m = /@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(l); o = Number(m?.[1] ?? 0); n = Number(m?.[2] ?? 0); out.push({ k: 'hunk', t: l }); }
+    else if (l.startsWith('+')) out.push({ k: 'add', n: n++, t: l.slice(1) });
+    else if (l.startsWith('-')) out.push({ k: 'del', o: o++, t: l.slice(1) });
+    else if (l.startsWith(' ')) out.push({ k: 'ctx', o: o++, n: n++, t: l.slice(1) });
+  }
+  return out;
+}
+
+/** GitHub Desktop's diff view: the host's copy is the old side (−), this PC is the new side (+). */
+function FileDiff({ projectId, destId, row, hostName, onClose }: { projectId: string; destId: string; row: FileRow; hostName: string; onClose: () => void }) {
+  const [d, setD] = useState<any>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => { call('diffProjectFile', { project_id: projectId, destination_location_id: destId, path: row.p }).then(setD, (e) => setErr(errText(e))); }, [projectId, destId, row.p]);
+  const lines = d?.diff ? parseDiff(d.diff) : d?.text != null ? d.text.split('\n').map((t: string, i: number) => ({ k: 'ctx', o: i + 1, n: i + 1, t })) : [];
+  const shown = lines.slice(0, 6000);
+  const adds = lines.filter((l: DiffLine) => l.k === 'add').length;
+  const dels = lines.filter((l: DiffLine) => l.k === 'del').length;
+  const size = (n: number) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`);
+  return (
+    <div className="gd-diff">
+      <div className="gd-diff-head">
+        <span className="gd-path"><span className="gd-dir">{row.p.slice(0, row.p.lastIndexOf('/') + 1)}</span><span className="gd-name">{row.p.slice(row.p.lastIndexOf('/') + 1)}</span></span>
+        {d?.diff && <span className="gd-diff-stat"><span className="add">+{adds}</span> <span className="del">−{dels}</span></span>}
+        <button className="ghost" onClick={onClose} title="Back to overview">✕</button>
+      </div>
+      <div className={`gd-diff-sub ${row.dirty ? 'dirty' : ''}`}>{row.dirty ? '! ' : ''}{row.t} <span className="muted">· <span className="del">−</span> {hostName} · <span className="add">+</span> this PC</span></div>
+      <div className="gd-diff-body">
+        {err && <div className="gd-diff-note"><Err e={err} /></div>}
+        {!d && !err && <div className="gd-diff-note muted">Reading the file on both sides…</div>}
+        {d?.binary && <div className="gd-diff-note">Binary file: no preview. This PC {d.source.exists ? size(d.source.size) : 'missing'} · {hostName} {d.destination.exists ? size(d.destination.size) : 'missing'}.</div>}
+        {d?.too_large && <div className="gd-diff-note">Too large to preview (over 512 KB). This PC {d.source.exists ? size(d.source.size) : 'missing'} · {hostName} {d.destination.exists ? size(d.destination.size) : 'missing'}.</div>}
+        {d?.diff === '' && <div className="gd-diff-note">Same content on both sides (differs only in file mode or line endings).</div>}
+        {d?.text != null && <div className="gd-diff-note muted">Identical on both sides.</div>}
+        {shown.length > 0 && (
+          <table className="gd-diff-table"><tbody>
+            {shown.map((l: DiffLine, i: number) => l.k === 'hunk'
+              ? <tr key={i} className="hunk"><td className="ln" /><td className="ln" /><td className="code">{l.t}</td></tr>
+              : <tr key={i} className={l.k}><td className="ln">{l.o ?? ''}</td><td className="ln">{l.n ?? ''}</td><td className="code"><span className="sign">{l.k === 'add' ? '+' : l.k === 'del' ? '−' : ' '}</span>{l.t}</td></tr>)}
+          </tbody></table>
+        )}
+        {lines.length > shown.length && <div className="gd-diff-note muted">{lines.length - shown.length} more lines not shown.</div>}
+      </div>
+    </div>
+  );
+}
+
+/** VS Code Remote-SSH when the host has an ssh alias (key hosts); otherwise copy an ssh command that opens a shell in the folder. */
+function HostOpenButton({ hostId, path }: { hostId: string; path: string }) {
+  const [msg, setMsg] = useState<string | null>(null);
+  const h = usePoll(() => call('getHost', { host_id: hostId }), [hostId], 30_000).data;
+  if (h?.ssh_alias) return <button onClick={() => window.api.openInVscode(path, h.ssh_alias)}>Open in VS Code (Remote)</button>;
+  return (
+    <button onClick={async () => {
+      const r = await call('connectionRecipe', { host_id: hostId, caller_environment: navigator.userAgent.includes('Windows') ? 'windows-native' : 'posix-native' });
+      await copy(r.display); setMsg('Copied'); setTimeout(() => setMsg(null), 1500);
+    }}>{msg ?? 'Copy SSH command'}</button>
+  );
+}
+
+function SyncDetail({ s }: { s: any }) {
+  const o = OUTCOME[s.outcome] ?? { icon: '?', cls: '', text: s.outcome };
+  return (
+    <div className="gd-detail">
+      <h2>{s.transfer_mode === 'gui_sync' ? 'Sync now' : 'Transfer'}{s.branch ? ` · ${s.branch}` : ''}</h2>
+      <div className="gd-detail-meta">
+        <span className={`gd-oc ${o.cls}`}>{o.icon} {o.text}</span>
+        {s.head && <span className="mono">⊶ {s.head.slice(0, 7)}</span>}
+        <span>{new Date(s.started_at).toLocaleString()}</span>
+        {s.evidence?.verdict && <span className={`badge v-${s.evidence.verdict}`}>{s.evidence.verdict.replaceAll('_', ' ')}</span>}
+      </div>
+      {s.evidence?.reason && <p>{s.evidence.reason}</p>}
+      {(s.evidence?.facts ?? []).length > 0 && (
+        <ul className="gd-facts">{s.evidence.facts.map((f: any, i: number) => (
+          <li key={i} className={f.blocking ? '' : 'muted'}><b>{f.kind.replaceAll('_', ' ')}</b>: {f.detail}{f.paths?.length ? <div className="mono small">{f.paths.slice(0, 20).join('  ')}{f.paths.length > 20 ? ' …' : ''}</div> : null}</li>
+        ))}</ul>
+      )}
+      <p className="muted small">Operation {s.operation_id}</p>
+    </div>
+  );
+}
+
+function MappingDialog({ hosts, hostId, projects, onClose }: { hosts: HostSummary[]; hostId: string; projects: any[]; onClose: () => void }) {
+  const [hid, setHid] = useState(hostId || hosts[0]?.id || '');
+  const h = usePoll(() => (hid ? call('getHost', { host_id: hid }) : Promise.resolve(null)), [hid], 60_000).data;
+  return (
+    <div className="modal-back" onClick={onClose}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+        <div className="row"><b>New mapping</b><span className="grow" /><button className="ghost" onClick={onClose}>✕</button></div>
+        <L t="Host"><select value={hid} onChange={(e) => setHid(e.target.value)}>{hosts.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></L>
+        {h && <NewMapping key={h.id} host={h} projects={projects} onDone={onClose} />}
       </div>
     </div>
   );

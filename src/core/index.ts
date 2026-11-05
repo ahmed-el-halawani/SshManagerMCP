@@ -83,6 +83,15 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     preflightProject: (i: unknown) => projects.preflightProject(ctx, i),
     verifyProjectSync: (i: unknown) => projects.verifyProjectSync(ctx, i),
     syncProject: (i: unknown) => projects.syncProject(ctx, i),
+    diffProjectFile: (i: unknown) => projects.diffProjectFile(ctx, i),
+    // GUI History tab: past verifications of one destination, with the source commit they were checked against.
+    syncHistory: (i: { destination_location_id: string; limit?: number }) => ({
+      syncs: (db.prepare(`SELECT v.id, v.started_at, v.verified_at, v.outcome, v.transfer_mode, v.operation_id, v.evidence_json,
+          json_extract(s.result_json, '$.git.head') AS head, json_extract(s.result_json, '$.git.branch') AS branch
+        FROM sync_verifications v LEFT JOIN inspections s ON s.id = json_extract(v.evidence_json, '$.source_inspection_id')
+        WHERE v.destination_location_id=? ORDER BY v.started_at DESC LIMIT ?`).all(z.uuid().parse(i.destination_location_id), Math.min(i.limit ?? 50, 200)) as Record<string, unknown>[])
+        .map(({ evidence_json, ...v }) => ({ ...v, evidence: JSON.parse(evidence_json as string) })),
+    }),
     acquireLease: (i: unknown) => projects.acquireLease(ctx, i),
     releaseLease: (i: unknown) => projects.releaseLease(ctx, i),
     // setup

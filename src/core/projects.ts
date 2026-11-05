@@ -732,7 +732,8 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
   const facts: Fact[] = [];
   const add = (kind: string, detail: string, paths?: string[], blocking = true) => facts.push({ kind, blocking, detail, ...(paths ? { paths: paths.slice(0, 50) } : {}) });
   const diff = { missing: [] as string[], changed: [] as string[], extra_owned: [] as string[], extra_unknown: [] as string[], filtered_only: [] as string[],
-    since_verified_sync: null as null | { local_only: string[]; remote_only: string[]; both: string[] } };
+    since_verified_sync: null as null | { local_only: string[]; remote_only: string[]; both: string[] },
+    dest_uncommitted: [] as string[], dest_committed: [] as string[] }; // full (unsliced) at-risk lists, for the GUI file list
   if (dst.path_state === 'unset') { add('path_unset', 'destination path is not set'); return { facts, diff }; }
   if (src.path_state !== 'exists') { add('path_missing', `source path state: ${src.path_state}`); return { facts, diff }; }
   if (dst.error) { add('needs_recheck', `${dst.error.code}: ${dst.error.message}`); return { facts, diff }; }
@@ -803,11 +804,13 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
     // is in Git and nothing is lost by updating it. Only a moved HEAD means commits made on the destination.
     const headMoved = !dg?.is_repo || !base.dst_head || dg.head !== base.dst_head;
     const committed = headMoved ? atRisk.filter((p) => !uncommitted.includes(p)) : [];
+    diff.dest_uncommitted = uncommitted; diff.dest_committed = committed;
     const conflictNote = since.both.length ? ` (${since.both.length} also changed on source = conflict)` : '';
     if (uncommitted.length) add('destination_dirty', `${uncommitted.length} file(s) changed on the destination after the last verified sync and are not committed there${conflictNote}; copying would overwrite that work`, uncommitted);
     if (committed.length) add('destination_ahead', `${committed.length} file(s) changed in commits made on the destination after the last verified sync (destination ${dg?.head?.slice(0, 12)} vs source ${sg?.head?.slice(0, 12)})${conflictNote}; the working tree there is clean, so git status shows nothing`, committed);
   } else {
     const destDirtyAtRisk = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
+    diff.dest_uncommitted = destDirtyAtRisk;
     if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten (no verified sync yet to tell who changed it)', destDirtyAtRisk);
   }
   if (diff.missing.length || diff.changed.length || diff.extra_owned.length || diff.extra_unknown.length) {
@@ -1025,6 +1028,7 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
       since_verified_sync: diff.since_verified_sync && Object.fromEntries(Object.entries(diff.since_verified_sync).map(([k, v]) => [k, v.length])), lease, next_step: next },
     facts: facts.map(compact), source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
     generations: { source: src.location_generation, destination: dest.location_generation },
+    ...(ctx.source === 'gui' ? { files: fileList(diff) } : {}),
     ...(full ? { evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t } : {}),
     ready_until: readyForIntent ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
     suggested_plan: ctx.source === 'gui' ? plan : { ...plan, exec: undefined }, toolchain: toolchainOut, // the plan is never shortened: its copy list is what the agent transfers
@@ -1181,4 +1185,63 @@ export function releaseLease(ctx: Ctx, raw: unknown) {
   const input = z.object({ location_id: z.uuid(), operation_id: z.string().min(1), owner: z.string().min(1) }).strict().parse(raw);
   const r = ctx.db.prepare('DELETE FROM project_operation_leases WHERE destination_location_id=? AND operation_id=? AND owner=?').run(input.location_id, input.operation_id, input.owner);
   return { released: Number(r.changes) > 0 };
+}
+
+/** GUI Changes list: every path that differs, with whether the destination's own work is on it. Not sent to agents. */
+function fileList(diff: ReturnType<typeof compare>['diff']) {
+  const dirty = new Set(diff.dest_uncommitted);
+  const ahead = new Set(diff.dest_committed);
+  const both = new Set(diff.since_verified_sync?.both ?? []);
+  const row = (status: 'modified' | 'added' | 'host_only') => (path: string) =>
+    ({ path, status, host_dirty: dirty.has(path), host_committed: ahead.has(path), conflict: both.has(path) });
+  return [...diff.changed.map(row('modified')), ...diff.missing.map(row('added')), ...[...diff.extra_owned, ...diff.extra_unknown].map(row('host_only'))]
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+const PREVIEW_MAX = 512 << 10;
+
+/**
+ * GUI file preview (no MCP tool): reads one project file on both sides and returns a unified diff (PC = new, host = old).
+ * Read-only. The path must stay inside the project, and credential files (.env, keys) are never read.
+ */
+export async function diffProjectFile(ctx: Ctx, raw: unknown) {
+  const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid(), path: z.string().min(1).max(1000) }).strict().parse(raw);
+  const rel = input.path.replaceAll('\\', '/');
+  if (rel.startsWith('/') || /^[a-z]:/i.test(rel) || rel.split('/').some((seg) => seg === '..' || seg === '')) throw new AppError('VALIDATION_ERROR', 'path must be relative to the project folder');
+  if (CREDENTIAL_EXCLUDES.some((g) => matchesGlob(rel, g))) throw new AppError('VALIDATION_ERROR', 'credential files are never read or shown');
+  const { src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
+  const s = getSettings(ctx.db);
+  const side = async (l: LocationRow): Promise<{ exists: boolean; size: number; data: Buffer | null }> => {
+    const root = l.canonical_path ?? l.path_input;
+    if (!root) return { exists: false, size: 0, data: null };
+    if (!l.host_id) {
+      const f = join(root, rel);
+      if (!existsSync(f) || !statSync(f).isFile()) return { exists: false, size: 0, data: null };
+      const size = statSync(f).size;
+      return { exists: true, size, data: size <= PREVIEW_MAX ? readFileSync(f) : null };
+    }
+    const host = getHostRow(ctx.db, l.host_id);
+    const r = await sshRun(ctx, host, `cd ${posixQuote(root)} && f=${posixQuote(rel)} && [ -f "$f" ] || exit 3; wc -c < "$f"; head -c ${PREVIEW_MAX + 1} -- "$f" | base64`, s.inspect_timeout_s, { maxBytes: PREVIEW_MAX * 2 });
+    if (r.exit_code === 3) return { exists: false, size: 0, data: null };
+    if (r.exit_code !== 0) throw new AppError(r.exit_code === 255 ? classify(r).code : 'REMOTE_COMMAND_FAILED', `reading the file on the host failed: ${sanitize(r.stderr).slice(0, 300)}`);
+    const [first, ...rest] = r.stdout.split('\n');
+    const size = Number(first.trim());
+    return { exists: true, size, data: size <= PREVIEW_MAX ? Buffer.from(rest.join(''), 'base64') : null };
+  };
+  const [a, b] = await Promise.all([side(dest), side(src)]);
+  const binary = [a.data, b.data].some((d) => d && d.subarray(0, 8000).includes(0));
+  const meta = (x: typeof a) => ({ exists: x.exists, size: x.size });
+  const out = { path: rel, source: meta(b), destination: meta(a), binary, too_large: (a.exists && !a.data) || (b.exists && !b.data), diff: null as string | null, text: null as string | null };
+  if (binary || out.too_large) return out;
+  if (a.data && b.data && a.data.equals(b.data)) return { ...out, text: b.data.toString('utf8') };
+  const tmp = mkdtempSync(join(tmpdir(), 'sshrm-diff-'));
+  try {
+    const fa = join(tmp, 'host'); const fb = join(tmp, 'pc');
+    writeFileSync(fa, a.data ?? ''); writeFileSync(fb, b.data ?? '');
+    // git diff --no-index exits 1 when the files differ: that is the normal case here.
+    const r = await run(splitCommand(s.git_path), ['diff', '--no-index', '--no-color', '--no-ext-diff', '-U3', '--', fa, fb], { timeoutMs: 20_000, maxBytes: 4 << 20 });
+    if (r.exit_code === null || r.exit_code > 1) throw new AppError('INTERNAL_ERROR', `git diff failed: ${sanitize(r.stderr).slice(0, 300)}`);
+    const body = r.stdout.slice(r.stdout.indexOf('\n@@') + 1);
+    return { ...out, diff: r.stdout.includes('\n@@') ? body : '' };
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
 }

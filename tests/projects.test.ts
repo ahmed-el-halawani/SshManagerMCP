@@ -430,6 +430,10 @@ test('Sync now (GUI): uncommitted files, then fast-forward with new commits, ver
   assert.equal(r.outcome, 'verified');
   assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
   assert.equal((await pre()).verdict, 'ready');
+  const hist = core.syncHistory({ destination_location_id: loc.id }).syncs as { outcome: string; transfer_mode: string; head: string; evidence: { verdict: string } }[];
+  assert.deepEqual(hist.map((h) => h.outcome), ['verified', 'verified'], 'History tab lists both syncs, newest first');
+  assert.equal(hist[0].head, git(src, 'rev-parse', 'HEAD'), 'with the source commit they were verified against');
+  assert.equal(hist[0].transfer_mode, 'gui_sync');
   core.acquireLease({ location_id: loc.id, operation_id: 'next', owner: 'agent' }); // the GUI lease was released
 });
 
@@ -481,4 +485,27 @@ test('Sync now at scale: 120 new files, Unicode names, uncommitted delete/rename
   r = await syncNow(core, project, loc);
   assert.equal(r.outcome, 'verified');
   assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+});
+
+test('GUI file list marks host-dirty files; file preview diffs PC vs host and never reads credentials', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst, makeCore('gui'));
+  writeFileSync(join(src, 'base.txt'), 'base\n');
+  await syncNow(core, project, loc); // a verified baseline, so host edits after it count as the host's own work
+  writeFileSync(join(src, 'a.txt'), 'pc edit\n');
+  writeFileSync(join(dst, 'src', 'new.txt'), 'host only\n');
+  writeFileSync(join(src, 'b.txt'), 'pc\n');
+  writeFileSync(join(dst, 'b.txt'), 'host\n');
+  const r = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, intent: 'transfer' }) as { files: { path: string; status: string; host_dirty: boolean }[] };
+  const by = Object.fromEntries(r.files.map((f) => [f.path, f]));
+  assert.equal(by['a.txt'].host_dirty, false, 'changed only on the PC: not dirty');
+  assert.equal(by['b.txt'].host_dirty, true, 'changed on the host too: dirty');
+  assert.equal(by['src/new.txt'].status, 'host_only');
+  const d = await core.diffProjectFile({ project_id: project.id, destination_location_id: loc.id, path: 'b.txt' }) as { diff: string };
+  assert.match(d.diff, /^-host$/m);
+  assert.match(d.diff, /^\+pc$/m);
+  for (const bad of ['.env', '../x', '/etc/passwd', 'a/../../x']) await assert.rejects(core.diffProjectFile({ project_id: project.id, destination_location_id: loc.id, path: bad }));
+  assert.equal((await core.preflightProject({ project_id: project.id, destination_location_id: loc.id }) as { files?: unknown }).files === undefined, false, 'gui core includes files');
+  assert.equal((await setup(src, dst).pre() as { files?: unknown }).files, undefined, 'agents never get the file list');
 });
