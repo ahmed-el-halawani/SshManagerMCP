@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, matchesGlob, win32, posix } from 'node:path';
 import { z } from 'zod';
@@ -263,7 +263,7 @@ export function parseStatus(z0: string) {
     const fieldsBeforePath = kind === '1' ? 8 : kind === '2' ? 9 : kind === 'u' ? 10 : 1;
     const parts = it.split(' ');
     const path = parts.slice(fieldsBeforePath).join(' ');
-    if (kind === '2') i++; // original path follows as its own NUL item
+    if (kind === '2') r.dirty_paths.push(items[++i]); // a rename's original path follows as its own NUL item: gone from the tree, so dirty too
     if (kind === '?') { r.untracked++; r.dirty_paths.push(path); continue; }
     if (kind === '!') continue;
     if (kind === 'u') { r.conflicts++; r.dirty_paths.push(path); continue; }
@@ -376,7 +376,6 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
     facts.detached = !facts.branch;
     facts.dirty_paths = underSubdir(facts.dirty_paths, facts.subdir); // porcelain paths are repo-root relative, manifests cwd-relative
     dirty = new Set(facts.dirty_paths);
-    facts.dirty_paths = facts.dirty_paths.slice(0, 50);
     files = (await g(['ls-files', '-z', '--cached', '--others', '--exclude-standard'], 64 << 20)).stdout.split('\0').filter(Boolean);
     index = parseIndex((await g(['ls-files', '-s', '-z'], 64 << 20)).stdout);
   } else {
@@ -497,7 +496,6 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
     facts.detached = !facts.branch;
     facts.dirty_paths = underSubdir(facts.dirty_paths, facts.subdir); // porcelain paths are repo-root relative, manifests cwd-relative
     dirty = new Set(facts.dirty_paths);
-    facts.dirty_paths = facts.dirty_paths.slice(0, 50);
   }
   const files = section(out, 'FILES').split('\0').map((f) => f.replace(/^\.\//, '')).filter(Boolean);
   const links = section(out, 'LINKS').split('\n').filter(Boolean).map((l) => { const [a, b] = l.split('\t'); return { p: a.replace(/^\.\//, ''), target: b ?? '' }; });
@@ -546,7 +544,7 @@ async function inspectLocation(ctx: Ctx, project: ProjectRow, l: LocationRow): P
   if (manifestRef) writeFileSync(manifestRef, JSON.stringify(insp.manifest!.entries));
   const hostGen = l.host_id ? getHostRow(ctx.db, l.host_id).identity_generation : null;
   tx(ctx.db, () => {
-    const { manifest, ...rest } = insp;
+    const { manifest, ...rest } = capDirty(insp);
     const stored = { ...rest, manifest: manifest ? { count: manifest.count, digest: manifest.digest, excluded: manifest.excluded } : undefined };
     ctx.db.prepare(`INSERT INTO inspections(id, project_id, location_id, location_revision, location_generation, host_identity_generation, inspected_at, path_state, result_json, manifest_ref, snapshot_id)
       VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id, project.id, l.id, l.revision, gen, hostGen, now(), insp.path_state, JSON.stringify(stored), manifestRef, snapshot);
@@ -572,8 +570,11 @@ function identityState(db: DB, project: ProjectRow, l: LocationRow, insp: Inspec
   return insp.git.root_commits?.some((c) => ident.root_commits!.includes(c)) ? 'verified' : 'mismatch';
 }
 
+/** Plans need every dirty path (copy/restore/delete lists); stored and returned inspections keep 50 (counts stay exact). */
+const capDirty = (i: Inspection): Inspection => (i.git ? { ...i, git: { ...i.git, dirty_paths: i.git.dirty_paths.slice(0, 50) } } : i);
+
 const summarize = (r: { id: string; inspection: Inspection; snapshot_id: string | null }) => {
-  const { manifest, ...rest } = r.inspection;
+  const { manifest, ...rest } = capDirty(r.inspection);
   return { inspection_id: r.id, snapshot_id: r.snapshot_id, ...rest, manifest: manifest ? { count: manifest.count, digest: manifest.digest, excluded: manifest.excluded } : null };
 };
 
@@ -722,7 +723,9 @@ function verifiedBaseline(db: DB, dest: LocationRow, srcId: string) {
   const ev = v ? JSON.parse(v.evidence_json) as { source_inspection_id?: string; destination_inspection_id?: string } : {};
   if (!v || !ev.source_inspection_id || !ev.destination_inspection_id) return null;
   const hashes = (id: string) => new Map(readManifest(db, id).map((e) => [e.p, e.h]));
-  return { same_source: v.source_location_id === srcId, src: hashes(ev.source_inspection_id), dst: hashes(ev.destination_inspection_id) };
+  const insp = db.prepare('SELECT result_json FROM inspections WHERE id=?').get(ev.destination_inspection_id) as { result_json: string } | undefined;
+  const dstHead = insp ? (JSON.parse(insp.result_json) as Inspection).git?.head ?? null : null;
+  return { same_source: v.source_location_id === srcId, src: hashes(ev.source_inspection_id), dst: hashes(ev.destination_inspection_id), dst_head: dstHead };
 }
 
 function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, src: Inspection, dst: Inspection, policy: ConsistencyPolicy) {
@@ -796,7 +799,10 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
     const dirtyList = new Set(dg?.dirty_paths ?? []);
     const listComplete = !dg?.is_repo || dirtyList.size >= dg.staged + dg.unstaged + dg.untracked + dg.conflicts;
     const uncommitted = atRisk.filter((p) => !dg?.is_repo || dirtyList.has(p) || !listComplete);
-    const committed = atRisk.filter((p) => !uncommitted.includes(p));
+    // Clean there with HEAD unmoved since that sync: the path went back to HEAD (reset, checkout ., stash), so its content
+    // is in Git and nothing is lost by updating it. Only a moved HEAD means commits made on the destination.
+    const headMoved = !dg?.is_repo || !base.dst_head || dg.head !== base.dst_head;
+    const committed = headMoved ? atRisk.filter((p) => !uncommitted.includes(p)) : [];
     const conflictNote = since.both.length ? ` (${since.both.length} also changed on source = conflict)` : '';
     if (uncommitted.length) add('destination_dirty', `${uncommitted.length} file(s) changed on the destination after the last verified sync and are not committed there${conflictNote}; copying would overwrite that work`, uncommitted);
     if (committed.length) add('destination_ahead', `${committed.length} file(s) changed in commits made on the destination after the last verified sync (destination ${dg?.head?.slice(0, 12)} vs source ${sg?.head?.slice(0, 12)})${conflictNote}; the working tree there is clean, so git status shows nothing`, committed);
@@ -823,7 +829,7 @@ const REMOTE_BUNDLE = '/tmp/sshrm-sync.bundle';
  * needed, history kept, the destination's own work is never overwritten: fetch refuses non-fast-forward). Only the
  * source's uncommitted files are copied by hand.
  */
-function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, root: string, dst?: Inspection, diff?: ReturnType<typeof compare>['diff']) {
+function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, root: string, policy: ConsistencyPolicy, dst?: Inspection, diff?: ReturnType<typeof compare>['diff']) {
   const branch = src.git!.branch!;
   // Uncommitted files a previous sync copied here (unchanged since; anything edited here is destination_dirty and never
   // reaches this plan). Once the source commits them, git refuses to fetch/switch over them, so put them back first.
@@ -834,7 +840,9 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
   const inScope = new Set(src.manifest?.entries.map((e) => e.p));
   const copy = underSubdir(src.git!.dirty_paths, src.git!.subdir).filter((p) => inScope.has(p));
   const r = posixQuote(root);
-  const crlf = crlfFix(src, copy, r);
+  const { cmd: crlf, files: lf } = crlfFix(src, copy, r);
+  const gone = goneInSource(src, policy);
+  const del = gone.length ? `cd ${r} && rm -f -- ${gone.slice(0, 200).map(posixQuote).join(' ')}` : '';
   const apply = (b: string) => ({
     clone: `git clone -q -b ${branch} ${b} ${r}`,
     switch: `git -C ${r} fetch -q ${b} ${branch}:${branch} && git -C ${r} switch -q ${branch}`,
@@ -850,15 +858,26 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
       `host: ${apply(REMOTE_BUNDLE)} && rm -f ${REMOTE_BUNDLE}${kind === 'clone' ? '' : '  # if git refuses, the destination has its own commits: stop and ask the user'}`,
       copy.length ? `copy the ${copy.length} uncommitted source file(s) in "copy" to the same relative paths` : '',
       crlf ? `host: ${crlf}  # Windows line endings -> LF, as Git stores them` : '',
+      del ? `host: ${del}  # deleted in the source, not committed yet` : '',
       'verify_sync with source_snapshot and generations from this preflight (no new preflight needed in between; verify re-reads both sides)',
     ].filter(Boolean),
     // What the GUI's "Sync now" runs (syncProject): host lines read the bundle from "$B"; GUI-only, stripped from MCP output.
-    exec: { local, root, branch, host: [restore, apply('"$B"')].filter(Boolean), copy, after: [crlf].filter(Boolean) } as SyncExec,
+    exec: { local, root, branch, host: [apply('"$B"')], restore: synced, copy, lf, remove: gone } as SyncExec,
   };
 }
 
-/** Host-side work for syncProject: bundle `branch` into "$B" and run `host`, then unpack `copy` (tar) into `root` and run `after`. */
-type SyncExec = { local: string; root: string; branch?: string; host: string[]; copy: string[]; after: string[] };
+/**
+ * Tracked files deleted (or renamed away) in the source but not committed yet: the commits still have them, so the host
+ * must remove them too. Only a source on this PC can be checked; credential/policy exclusions are never touched.
+ */
+function goneInSource(src: Inspection, policy: ConsistencyPolicy) {
+  if (src.home || !src.git?.is_repo || !src.canonical_path) return [];
+  const inScope = new Set(src.manifest?.entries.map((e) => e.p));
+  return applyExclusions(underSubdir(src.git.dirty_paths, src.git.subdir).filter((p) => !inScope.has(p) && !existsSync(join(src.canonical_path!, p))), true, policy).kept;
+}
+
+/** Host-side work for syncProject: `restore` earlier synced copies, run `host` with the bundle of `branch` in "$B", unpack `copy` (tar, `lf` files as LF) into `root`, then `remove` deleted paths. */
+type SyncExec = { local: string; root: string; branch?: string; host: string[]; restore: string[]; copy: string[]; lf: string[]; remove: string[] };
 
 /**
  * A copied working-tree file carries this checkout's bytes: a Windows autocrlf checkout has CRLF where Git (and the host)
@@ -873,7 +892,7 @@ function crlfFix(src: Inspection, copy: string[], r: string) {
       return blobOf.get(p) && bytes.includes(13) && createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== blobOf.get(p);
     } catch { return false; } // source not on this PC
   });
-  return crlf.length ? `cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}` : '';
+  return { files: crlf, cmd: crlf.length ? `cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}` : '' };
 }
 
 function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: LocationRow, diff: ReturnType<typeof compare>['diff']) {
@@ -886,7 +905,7 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
     case 'path_unset': return { kind: 'set_path', steps: ['Ask the user for the destination path, then update_project_location. Do not invent one.'] };
     case 'path_missing': return dest.mode !== 'create_if_missing'
       ? { kind: 'fix_path', steps: ['The adopted path does not exist. Ask the user for the correct existing path, or switch mode to create_if_missing explicitly.'] }
-      : srcGit ? gitPlan('clone', src, root)
+      : srcGit ? gitPlan('clone', src, root, policyOf(dest))
       : { kind: 'create_then_transfer', steps: [`With the user's explicit choice: mkdir -p ${posixQuote(root)} via ssh`, 'Transfer the source scope', 'verify_project_sync'] };
     case 'wrong_repository': return { kind: 'rebind', steps: ['Do not modify this folder. Ask the user for the correct checkout path, or confirm identity explicitly if this really is a fork (update_project_location confirm_identity).'] };
     case 'conflicts_present': return { kind: 'manual', steps: ['Resolve merge conflicts with the user. Never reset, clean, or checkout --force automatically.'] };
@@ -899,9 +918,9 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
         `To sync instead, bring those commits to the source first: on the destination 'git bundle create ahead.bundle ${s}..HEAD', copy it to the source, 'git fetch ahead.bundle HEAD' and merge there. Never overwrite them.`] };
     }
     case 'branch_mismatch': return bothGit
-      ? gitPlan('switch', src, root, dst, diff)
+      ? gitPlan('switch', src, root, policyOf(dest), dst, diff)
       : { kind: 'choose_checkout', steps: ['Prefer another existing checkout/worktree on the right branch, or (if destination is clean and the user agrees) git switch <branch> there. Do not force a branch to match names.'] };
-    case 'revision_mismatch': if (bothGit) return gitPlan('fast_forward', src, root, dst, diff);
+    case 'revision_mismatch': if (bothGit) return gitPlan('fast_forward', src, root, policyOf(dest), dst, diff);
       steps.push(
       `Move commits without a cloud remote: on source 'git bundle create sync.bundle ${dst.git?.head ? `${dst.git.head.slice(0, 12)}..` : ''}${src.git?.branch ?? 'HEAD'}', scp it, then on destination 'git fetch sync.bundle ${src.git?.branch ?? 'HEAD'}' and 'git merge --ff-only FETCH_HEAD'.`,
       'If --ff-only fails the destination is ahead/diverged: stop and ask the user.');
@@ -911,11 +930,13 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
     case 'identity_unverified': {
       const copy = [...diff.changed, ...diff.missing];
       // GUI "Sync now": only Git on both sides, nothing unknown on the destination, lists not truncated.
-      const execOk = bothGit && verdict === 'content_mismatch' && !diff.extra_unknown.length && copy.length <= 200 && diff.extra_owned.length <= 200;
+      // "Unknown" destination files the source deleted without committing are tracked and clean there (same HEAD): removable.
+      const gone = new Set(goneInSource(src, policyOf(dest)));
+      const dstDirty = new Set(dst.git?.dirty_paths ?? []);
+      const execOk = bothGit && verdict === 'content_mismatch' && diff.extra_unknown.every((p) => gone.has(p) && !dstDirty.has(p));
       const r = posixQuote(root);
-      const after = [diff.extra_owned.length ? `cd ${r} && rm -f -- ${diff.extra_owned.map(posixQuote).join(' ')}` : '', crlfFix(src, copy, r)].filter(Boolean);
       return {
-        ...(execOk ? { exec: { local: src.canonical_path ?? '<source>', root, host: [], copy, after } as SyncExec } : {}),
+        ...(execOk ? { exec: { local: src.canonical_path ?? '<source>', root, host: [], restore: [], copy, lf: crlfFix(src, copy, r).files, remove: [...diff.extra_owned, ...diff.extra_unknown] } as SyncExec } : {}),
         kind: 'incremental_transfer',
         copy: [...diff.changed, ...diff.missing].slice(0, 200), copy_count: diff.changed.length + diff.missing.length,
         delete_owned_stale: diff.extra_owned.slice(0, 200), unknown_destination_files: diff.extra_unknown.slice(0, 200),
@@ -1076,24 +1097,24 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
       const r = await run(cmd, args, { cwd: exec.local, timeoutMs: s.inspect_timeout_s * 1000 });
       if (r.exit_code !== 0) throw new AppError('INTERNAL_ERROR', `${what} failed: ${sanitize(r.stderr).slice(0, 400)}`);
     };
+    const r = posixQuote(exec.root);
+    // Path lists travel NUL-separated on stdin (xargs -0), never on the command line: Windows caps it at 32K characters.
+    const list = (paths: string[]) => Buffer.from(paths.map((p) => `${p}\0`).join(''));
+    if (exec.restore.length) {
+      await remote(`cd ${r} && xargs -0 sh -c 'for p; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done' _`, list(exec.restore), 'restoring previously synced copies');
+    }
     if (exec.branch) {
       const b = join(tmp, 'sync.bundle');
       await local(splitCommand(s.git_path), ['bundle', 'create', '-q', b, exec.branch], 'git bundle');
       await remote(`B=$(mktemp) && cat > "$B" && ${exec.host.join(' && ')}; rc=$?; rm -f "$B"; exit $rc`, readFileSync(b), 'updating the destination checkout');
     }
-    if (exec.copy.length || exec.after.length) {
-      let tar = Buffer.alloc(0);
-      if (exec.copy.length) {
-        const t = join(tmp, 'files.tar');
-        writeFileSync(join(tmp, 'list'), exec.copy.join('\n'));
-        // Windows' own bsdtar: Git-Bash's GNU tar reads "C:\..." as a remote host:path
-        const tarExe = process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
-        await local([tarExe], ['-cf', t, '-T', join(tmp, 'list')], 'packing uncommitted files');
-        tar = readFileSync(t);
-      }
-      const r = posixQuote(exec.root);
-      await remote([exec.copy.length ? `mkdir -p ${r} && tar -xf - -C ${r}` : '', ...exec.after].filter(Boolean).join(' && '), tar, 'copying files');
+    if (exec.copy.length) {
+      // Executable bits come from the index (Windows has none); a copied 755 script must not turn 644 on the host.
+      const ls = await run(splitCommand(s.git_path), ['ls-files', '-s', '-z'], { cwd: exec.local, timeoutMs: s.inspect_timeout_s * 1000, maxBytes: 64 << 20 });
+      const execs = new Set(ls.stdout.split('\0').filter((l) => l.startsWith('100755 ')).map((l) => l.slice(l.indexOf('\t') + 1)));
+      await remote(`mkdir -p ${r} && tar -xf - -C ${r}`, tarOf(exec.local, exec.copy, execs, new Set(exec.lf)), 'copying files');
     }
+    if (exec.remove.length) await remote(`cd ${r} && xargs -0 rm -f --`, list(exec.remove), 'removing deleted files');
     const v = await verifyProjectSync(ctx, { project_id: input.project_id, destination_location_id: dest.id, expected_source_snapshot: pre.source_snapshot!,
       operation_id: op, expected_generations: pre.generations, transfer_mode: 'gui_sync' });
     return { outcome: v.outcome, verdict: (v as { verdict?: string }).verdict ?? null, commit: pre.summary.source.head, files_copied: exec.copy.length,
@@ -1102,6 +1123,37 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
     releaseLease(ctx, { location_id: dest.id, operation_id: op, owner: 'gui' });
     rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+/**
+ * A pax tar of `files` (relative to `dir`), built in-process: Windows' tar.exe garbles non-ASCII names from -T lists and
+ * crashes on them as arguments. Each file gets a pax `path` record, so UTF-8 and long paths reach the host exactly.
+ */
+export function tarOf(dir: string, files: string[], execs: Set<string> = new Set(), lf: Set<string> = new Set()) {
+  const header = (name: string, size: number, type: string, mode: number) => {
+    const h = Buffer.alloc(512);
+    const oct = (n: number, len: number, at: number) => h.write(`${n.toString(8).padStart(len - 1, '0')}\0`, at, 'ascii');
+    h.write(name.replace(/[^\x20-\x7e]/g, '_').slice(-99), 0, 'ascii');
+    oct(mode, 8, 100); oct(0, 8, 108); oct(0, 8, 116); oct(size, 12, 124); oct(Math.floor(Date.now() / 1000), 12, 136);
+    h.write(type, 156, 'ascii'); h.write('ustar\0' + '00', 257, 'ascii');
+    h.fill(' ', 148, 156);
+    h.write(`${h.reduce((a, b) => a + b, 0).toString(8).padStart(6, '0')}\0 `, 148, 'ascii');
+    return h;
+  };
+  const pad = (b: Buffer) => Buffer.concat([b, Buffer.alloc((512 - (b.length % 512)) % 512)]);
+  const out: Buffer[] = [];
+  for (const f of files) {
+    const raw = readFileSync(join(dir, f)); // ponytail: a symlink is sent as its target's content; Windows checkouts rarely have them
+    // CRLF -> LF for files Git stores with LF (autocrlf checkout): the host gets the bytes Git has
+    const data = lf.has(f) ? Buffer.from(raw.toString('latin1').replaceAll('\r\n', '\n'), 'latin1') : raw;
+    const body = ` path=${f}\n`;
+    let n = Buffer.byteLength(body);
+    while (String(n).length + Buffer.byteLength(body) !== n) n = String(n).length + Buffer.byteLength(body);
+    const rec = Buffer.from(`${n}${body}`);
+    out.push(header('PaxHeader', rec.length, 'x', 0o644), pad(rec), header(f, data.length, '0', execs.has(f) ? 0o755 : 0o644), pad(data));
+  }
+  out.push(Buffer.alloc(1024));
+  return Buffer.concat(out);
 }
 
 // ---------------- leases ----------------

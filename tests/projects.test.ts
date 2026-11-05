@@ -456,3 +456,29 @@ test('Sync now clones a missing create_if_missing destination', async () => {
   assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
   assert.equal(readFileSync(join(dst, 'wip.txt'), 'utf8'), 'uncommitted\n');
 });
+
+test('Sync now at scale: 120 new files, Unicode names, uncommitted delete/rename; a host reset back to HEAD is not "ahead"', async () => {
+  const src = tempRepo({ 'a.txt': 'hello\n', 'src/b.txt': 'bee\n', 'old.txt': 'old\n', 'gone.txt': 'gone\n' });
+  const dst = cloneTo(src);
+  const { core, project, loc, pre } = setup(src, dst);
+  mkdirSync(join(src, 'bulk dir'), { recursive: true });
+  for (let i = 0; i < 120; i++) writeFileSync(join(src, 'bulk dir', `f ${i}.txt`), `n${i}\n`); // more than the 50 dirty paths an inspection stores
+  writeFileSync(join(src, 'ملاحظات.md'), 'arabic name\n');
+  git(src, 'mv', 'old.txt', 'renamed.txt');
+  rmSync(join(src, 'gone.txt'));
+  let r = await syncNow(core, project, loc);
+  assert.equal(r.outcome, 'verified');
+  assert.equal(readFileSync(join(dst, 'ملاحظات.md'), 'utf8'), 'arabic name\n');
+  assert.ok(existsSync(join(dst, 'renamed.txt')) && !existsSync(join(dst, 'old.txt')) && !existsSync(join(dst, 'gone.txt')));
+
+  // someone cleans the host back to HEAD (reset/checkout .): content is in Git, so this is not destination work
+  git(dst, 'reset', '-q', '--hard');
+  git(dst, 'clean', '-qfd');
+  git(src, 'add', '-A');
+  git(src, 'commit', '-qm', 'bulk');
+  writeFileSync(join(src, 'later.txt'), 'later\n');
+  assert.equal((await pre()).verdict, 'revision_mismatch');
+  r = await syncNow(core, project, loc);
+  assert.equal(r.outcome, 'verified');
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+});
