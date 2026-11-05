@@ -82,6 +82,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     findProjectOnHost: (i: unknown) => projects.findProjectOnHost(ctx, i),
     preflightProject: (i: unknown) => projects.preflightProject(ctx, i),
     verifyProjectSync: (i: unknown) => projects.verifyProjectSync(ctx, i),
+    syncProject: (i: unknown) => projects.syncProject(ctx, i),
     acquireLease: (i: unknown) => projects.acquireLease(ctx, i),
     releaseLease: (i: unknown) => projects.releaseLease(ctx, i),
     // setup

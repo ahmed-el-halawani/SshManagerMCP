@@ -27,7 +27,7 @@ export function childEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   return env;
 }
 
-export function run(command: string[], args: string[], opts: { timeoutMs: number; maxBytes?: number; input?: string; cwd?: string; signal?: AbortSignal; env?: Record<string, string> }): Promise<RunResult> {
+export function run(command: string[], args: string[], opts: { timeoutMs: number; maxBytes?: number; input?: string | Buffer; cwd?: string; signal?: AbortSignal; env?: Record<string, string> }): Promise<RunResult> {
   const max = opts.maxBytes ?? MAX_STREAM;
   const started = Date.now();
   return new Promise((resolve) => {

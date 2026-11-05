@@ -20,7 +20,7 @@ const marker = () => `__SSHRM_${randomUUID().slice(0, 8)}__`;
 const lines = (s: string) => s.split(/\r?\n/).map((l) => l.trim());
 
 // With no stored password the askpass helper declines, so ssh still reports trust problems first.
-export async function sshRun(ctx: Ctx, row: HostRow, cmd: string, timeoutS: number, extra: { maxBytes?: number; input?: string } = {}): Promise<RunResult> {
+export async function sshRun(ctx: Ctx, row: HostRow, cmd: string, timeoutS: number, extra: { maxBytes?: number; input?: string | Buffer } = {}): Promise<RunResult> {
   const s = getSettings(ctx.db);
   const p = connectProfile(row);
   const { args, env } = sshArgs(p, ctx.dataDir, s, cmd, row.id);

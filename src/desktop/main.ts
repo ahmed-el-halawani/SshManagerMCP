@@ -17,7 +17,7 @@ const log = createLogger(core.dataDir, 'gui');
 // Only these core methods are reachable from the renderer. No shell/exec channel exists.
 const ALLOWED = new Set(['parseConnectionInput', 'registerHost', 'updateHost', 'duplicateHost', 'listHosts', 'getHost', 'removeHost', 'checkHost', 'probeCapabilities',
   'approveHostKey', 'connectionRecipe', 'setHostPassword', 'clearHostPassword', 'switchToKeyAuth','setSigningMode', 'setupBuildKeychain', 'listRemoteDir', 'hostHistory', 'registerProject', 'listProjects', 'getProject', 'removeProject', 'bindProjectLocation',
-  'updateProjectLocation', 'unbindProjectLocation', 'inspectProject', 'findProjectOnHost', 'preflightProject', 'getSettings', 'setSettings', 'environment']);
+  'updateProjectLocation', 'unbindProjectLocation', 'inspectProject', 'findProjectOnHost', 'preflightProject', 'syncProject', 'getSettings', 'setSettings', 'environment']);
 
 ipcMain.handle('core', async (_e, method: string, arg: unknown) => {
   if (!ALLOWED.has(method)) return { ok: false, error: { code: 'VALIDATION_ERROR', message: `unknown method ${method}` } };

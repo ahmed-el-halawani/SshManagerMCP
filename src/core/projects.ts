@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, matchesGlob, win32, posix } from 'node:path';
 import { z } from 'zod';
 import { sshRun, type Ctx } from './checks.ts';
@@ -833,8 +833,39 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
   const bundle = process.platform === 'win32' ? '$env:TEMP\\sshrm-sync.bundle' : '/tmp/sshrm-sync.bundle';
   const inScope = new Set(src.manifest?.entries.map((e) => e.p));
   const copy = underSubdir(src.git!.dirty_paths, src.git!.subdir).filter((p) => inScope.has(p));
-  // A copied working-tree file carries this checkout's bytes: a Windows autocrlf checkout has CRLF where Git (and the host)
-  // has LF. Where Git's blob id differs from the raw bytes' blob id, Git normalised the file: undo the CRLF on the host.
+  const r = posixQuote(root);
+  const crlf = crlfFix(src, copy, r);
+  const apply = (b: string) => ({
+    clone: `git clone -q -b ${branch} ${b} ${r}`,
+    switch: `git -C ${r} fetch -q ${b} ${branch}:${branch} && git -C ${r} switch -q ${branch}`,
+    fast_forward: `git -C ${r} fetch -q ${b} ${branch} && git -C ${r} merge -q --ff-only FETCH_HEAD`,
+  }[kind]);
+  const restore = synced.length ? `cd ${r} && for p in ${synced.slice(0, 200).map(posixQuote).join(' ')}; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done` : '';
+  return {
+    kind: `git_${kind}`, copy, copy_count: copy.length,
+    steps: [
+      `source: git -C ${posixQuote(local)} bundle create ${bundle} ${branch}`,
+      `copy ${bundle} to the host as ${REMOTE_BUNDLE} (scp, recipe purpose:"file_transfer")`,
+      restore ? `host: ${restore}  # the manager checked these are exactly the uncommitted copies the last verified sync put here (nothing edited since); the incoming commits bring them back, untracked ones included` : '',
+      `host: ${apply(REMOTE_BUNDLE)} && rm -f ${REMOTE_BUNDLE}${kind === 'clone' ? '' : '  # if git refuses, the destination has its own commits: stop and ask the user'}`,
+      copy.length ? `copy the ${copy.length} uncommitted source file(s) in "copy" to the same relative paths` : '',
+      crlf ? `host: ${crlf}  # Windows line endings -> LF, as Git stores them` : '',
+      'verify_sync with source_snapshot and generations from this preflight (no new preflight needed in between; verify re-reads both sides)',
+    ].filter(Boolean),
+    // What the GUI's "Sync now" runs (syncProject): host lines read the bundle from "$B"; GUI-only, stripped from MCP output.
+    exec: { local, root, branch, host: [restore, apply('"$B"')].filter(Boolean), copy, after: [crlf].filter(Boolean) } as SyncExec,
+  };
+}
+
+/** Host-side work for syncProject: bundle `branch` into "$B" and run `host`, then unpack `copy` (tar) into `root` and run `after`. */
+type SyncExec = { local: string; root: string; branch?: string; host: string[]; copy: string[]; after: string[] };
+
+/**
+ * A copied working-tree file carries this checkout's bytes: a Windows autocrlf checkout has CRLF where Git (and the host)
+ * has LF. Where Git's blob id differs from the raw bytes' blob id, Git normalised the file: undo the CRLF on the host.
+ */
+function crlfFix(src: Inspection, copy: string[], r: string) {
+  const local = src.canonical_path ?? '<source>';
   const blobOf = new Map(src.manifest?.entries.map((e) => [e.p, e.g]));
   const crlf = copy.filter((p) => {
     try {
@@ -842,24 +873,7 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
       return blobOf.get(p) && bytes.includes(13) && createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== blobOf.get(p);
     } catch { return false; } // source not on this PC
   });
-  const r = posixQuote(root);
-  const apply = {
-    clone: `git clone -q -b ${branch} ${REMOTE_BUNDLE} ${r}`,
-    switch: `git -C ${r} fetch -q ${REMOTE_BUNDLE} ${branch}:${branch} && git -C ${r} switch -q ${branch}`,
-    fast_forward: `git -C ${r} fetch -q ${REMOTE_BUNDLE} ${branch} && git -C ${r} merge -q --ff-only FETCH_HEAD`,
-  }[kind];
-  return {
-    kind: `git_${kind}`, copy, copy_count: copy.length,
-    steps: [
-      `source: git -C ${posixQuote(local)} bundle create ${bundle} ${branch}`,
-      `copy ${bundle} to the host as ${REMOTE_BUNDLE} (scp, recipe purpose:"file_transfer")`,
-      synced.length ? `host: cd ${r} && for p in ${synced.slice(0, 200).map(posixQuote).join(' ')}; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done  # the manager checked these are exactly the uncommitted copies the last verified sync put here (nothing edited since); the incoming commits bring them back, untracked ones included` : '',
-      `host: ${apply} && rm -f ${REMOTE_BUNDLE}${kind === 'clone' ? '' : '  # if git refuses, the destination has its own commits: stop and ask the user'}`,
-      copy.length ? `copy the ${copy.length} uncommitted source file(s) in "copy" to the same relative paths` : '',
-      crlf.length ? `host: cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}  # Windows line endings -> LF, as Git stores them` : '',
-      'verify_sync with source_snapshot and generations from this preflight (no new preflight needed in between; verify re-reads both sides)',
-    ].filter(Boolean),
-  };
+  return crlf.length ? `cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}` : '';
 }
 
 function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: LocationRow, diff: ReturnType<typeof compare>['diff']) {
@@ -894,8 +908,14 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
       // falls through to content plan
     // eslint-disable-next-line no-fallthrough
     case 'content_mismatch':
-    case 'identity_unverified':
+    case 'identity_unverified': {
+      const copy = [...diff.changed, ...diff.missing];
+      // GUI "Sync now": only Git on both sides, nothing unknown on the destination, lists not truncated.
+      const execOk = bothGit && verdict === 'content_mismatch' && !diff.extra_unknown.length && copy.length <= 200 && diff.extra_owned.length <= 200;
+      const r = posixQuote(root);
+      const after = [diff.extra_owned.length ? `cd ${r} && rm -f -- ${diff.extra_owned.map(posixQuote).join(' ')}` : '', crlfFix(src, copy, r)].filter(Boolean);
       return {
+        ...(execOk ? { exec: { local: src.canonical_path ?? '<source>', root, host: [], copy, after } as SyncExec } : {}),
         kind: 'incremental_transfer',
         copy: [...diff.changed, ...diff.missing].slice(0, 200), copy_count: diff.changed.length + diff.missing.length,
         delete_owned_stale: diff.extra_owned.slice(0, 200), unknown_destination_files: diff.extra_unknown.slice(0, 200),
@@ -904,6 +924,7 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
           diff.extra_unknown.length ? 'Unknown destination files were not created by sync: ask the user, add an exclusion, or remove them deliberately. They block ready.' : '',
           'verify_project_sync with the expected_source_snapshot, then release_project_lease'].filter(Boolean),
       };
+    }
     default: return { kind: 'manual', steps: ['Inspect facts and resolve with the user.'] };
   }
 }
@@ -985,7 +1006,7 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
     generations: { source: src.location_generation, destination: dest.location_generation },
     ...(full ? { evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t } : {}),
     ready_until: readyForIntent ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
-    suggested_plan: plan, toolchain: toolchainOut, // the plan is never shortened: its copy list is what the agent transfers
+    suggested_plan: ctx.source === 'gui' ? plan : { ...plan, exec: undefined }, toolchain: toolchainOut, // the plan is never shortened: its copy list is what the agent transfers
     ...(full ? { source: summarize(s), destination: summarize(d) } : {}),
   };
 }
@@ -1024,6 +1045,63 @@ export async function verifyProjectSync(ctx: Ctx, raw: unknown) {
   record(outcome, { source_inspection_id: s.id, destination_inspection_id: d.id, verdict, facts: facts.slice(0, 20) });
   return { verification_id: id, outcome, verdict, facts, source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
     note: outcome === 'verified' ? 'Verified by the manager reading both sides; agent claims were not used as evidence.' : 'Not verified. Do not build from this destination yet.' };
+}
+
+/**
+ * GUI "Sync now" (no MCP tool): carries out preflight's own Git plan, then verifies. Committed work travels as a bundle
+ * and uncommitted files as a tar, both over the ssh session's stdin (no scp, same path for password hosts). Git refuses
+ * non-fast-forward updates, and preflight offers no exec when the destination is dirty, ahead or has unknown files.
+ */
+export async function syncProject(ctx: Ctx, raw: unknown) {
+  const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid() }).strict().parse(raw);
+  const { src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
+  if (!dest.host_id || src.host_id) throw new AppError('VALIDATION_ERROR', 'Sync now copies from a source on this PC to a remote host');
+  const op = `gui-sync-${randomUUID()}`;
+  acquireLease(ctx, { location_id: dest.id, operation_id: op, owner: 'gui', ttl_seconds: 900 });
+  const tmp = mkdtempSync(join(tmpdir(), 'sshrm-sync-'));
+  try {
+    const pre = await preflightProject({ ...ctx, source: 'gui' }, { ...input, intent: 'transfer' });
+    const exec = (pre.suggested_plan as { exec?: SyncExec }).exec;
+    if (!exec) throw new AppError('VALIDATION_ERROR', `nothing Sync now can do safely (verdict ${pre.verdict})`, { next_action: pre.summary.next_step });
+    const s = getSettings(ctx.db);
+    const host = getHostRow(ctx.db, dest.host_id);
+    const remote = async (script: string, input: Buffer, what: string) => {
+      const r = await sshRun(ctx, host, script, s.inspect_timeout_s, { input, maxBytes: 64 << 10 });
+      if (r.exit_code === 0) return;
+      const refused = /fast-forward|non-fast-forward|would be overwritten/i.test(r.stderr);
+      throw new AppError(r.exit_code === 255 ? classify(r).code : 'REMOTE_COMMAND_FAILED', `${what} failed (exit ${r.exit_code}): ${sanitize(r.stderr).slice(0, 400)}`,
+        { details: { diagnostics: diagnostics(r) }, next_action: refused ? 'The destination changed since preflight (own commits or edits). Run Preflight again; nothing was overwritten.' : 'Run Preflight again to see the current state.' });
+    };
+    const local = async (cmd: string[], args: string[], what: string) => {
+      const r = await run(cmd, args, { cwd: exec.local, timeoutMs: s.inspect_timeout_s * 1000 });
+      if (r.exit_code !== 0) throw new AppError('INTERNAL_ERROR', `${what} failed: ${sanitize(r.stderr).slice(0, 400)}`);
+    };
+    if (exec.branch) {
+      const b = join(tmp, 'sync.bundle');
+      await local(splitCommand(s.git_path), ['bundle', 'create', '-q', b, exec.branch], 'git bundle');
+      await remote(`B=$(mktemp) && cat > "$B" && ${exec.host.join(' && ')}; rc=$?; rm -f "$B"; exit $rc`, readFileSync(b), 'updating the destination checkout');
+    }
+    if (exec.copy.length || exec.after.length) {
+      let tar = Buffer.alloc(0);
+      if (exec.copy.length) {
+        const t = join(tmp, 'files.tar');
+        writeFileSync(join(tmp, 'list'), exec.copy.join('\n'));
+        // Windows' own bsdtar: Git-Bash's GNU tar reads "C:\..." as a remote host:path
+        const tarExe = process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
+        await local([tarExe], ['-cf', t, '-T', join(tmp, 'list')], 'packing uncommitted files');
+        tar = readFileSync(t);
+      }
+      const r = posixQuote(exec.root);
+      await remote([exec.copy.length ? `mkdir -p ${r} && tar -xf - -C ${r}` : '', ...exec.after].filter(Boolean).join(' && '), tar, 'copying files');
+    }
+    const v = await verifyProjectSync(ctx, { project_id: input.project_id, destination_location_id: dest.id, expected_source_snapshot: pre.source_snapshot!,
+      operation_id: op, expected_generations: pre.generations, transfer_mode: 'gui_sync' });
+    return { outcome: v.outcome, verdict: (v as { verdict?: string }).verdict ?? null, commit: pre.summary.source.head, files_copied: exec.copy.length,
+      note: v.outcome === 'verified' ? `Synced${pre.summary.source.head ? ` to ${pre.summary.source.head}` : ''} and verified.` : `Sync ran but verify says ${v.outcome}: ${'reason' in v ? v.reason : 'run Preflight'}` };
+  } finally {
+    releaseLease(ctx, { location_id: dest.id, operation_id: op, owner: 'gui' });
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 // ---------------- leases ----------------

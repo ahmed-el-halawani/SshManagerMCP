@@ -970,7 +970,11 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
   const [pre, setPre] = useState<any>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const run = async (label: string, fn: () => Promise<unknown>) => { setBusy(label); setErr(null); try { await fn(); } catch (e) { setErr(errText(e)); } finally { setBusy(null); reload(); } };
+  const [synced, setSynced] = useState<string | null>(null);
+  const run = async (label: string, fn: () => Promise<unknown>) => { setBusy(label); setErr(null); setSynced(null); try { await fn(); } catch (e) { setErr(errText(e)); } finally { setBusy(null); reload(); } };
+  const exec = pre?.suggested_plan.exec;
+  const syncLabel = exec && [{ git_clone: 'clone', git_switch: 'switch branch', git_fast_forward: 'fast-forward' }[pre.suggested_plan.kind as string],
+    exec.copy.length ? `${exec.copy.length} file${exec.copy.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' + ');
   const gitLine = (l: any) => l?.last_inspection ? `${l.last_inspection.branch ?? (l.last_inspection.detached ? 'detached' : 'no git')}${l.last_inspection.head ? ' ' + l.last_inspection.head.slice(0, 8) : ''}${l.last_inspection.dirty && (l.last_inspection.dirty.staged + l.last_inspection.dirty.unstaged + l.last_inspection.dirty.untracked) ? ` · ${l.last_inspection.dirty.staged + l.last_inspection.dirty.unstaged + l.last_inspection.dirty.untracked} uncommitted` : ''} · ${age(l.last_inspection.at)}` : 'not inspected';
   const side = (which: 'src' | 'dst', l: any, title: string, hostId: string | null) => (
     <div className="side">
@@ -1004,6 +1008,9 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
         <span className="small muted">{dest.last_verified_sync ? `synced & verified ${age(dest.last_verified_sync.verified_at)}` : 'never verified'}{dest.last_sync_attempt && !dest.last_verified_sync ? ` · last attempt ${dest.last_sync_attempt.outcome}` : ''}</span>
         <span className="grow" />
         <button disabled={!!busy} onClick={() => run('pre', async () => setPre(await call('preflightProject', { project_id: project.id, destination_location_id: dest.id, intent: 'build' })))}>{busy === 'pre' ? 'Checking…' : 'Preflight'}</button>
+        {exec && <button className="primary" disabled={!!busy} title="Runs the plan below over SSH (fast-forward only, never overwrites destination work), then verifies"
+          onClick={() => run('sync', async () => { const r = await call('syncProject', { project_id: project.id, destination_location_id: dest.id }); setPre(null); setSynced(r.note); })}>
+          {busy === 'sync' ? 'Syncing…' : `Sync now${syncLabel ? ` (${syncLabel})` : ''}`}</button>}
         <button className="danger" onClick={() => {
           const onlyHost = project.locations.filter((l: any) => l.role !== 'source').length === 1;
           if (!confirm(`Remove the mapping of "${project.name}" to ${host.name}?\n\nMetadata only: no folder on either machine is touched.${onlyHost ? '\nThe project itself is removed too (it has no other hosts).' : ''}`)) return;
@@ -1014,6 +1021,7 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
         }}>Remove</button>
       </div>
       <Err e={err} />
+      {synced && <div className="small">✓ {synced}</div>}
       <div className="sides">
         {side('src', source, 'Source · this PC', null)}
         <div className="arrow">→</div>
@@ -1025,7 +1033,7 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
           <div className="row"><span className={`badge v-${pre.verdict}`}>{pre.verdict.replaceAll('_', ' ')}</span><span className="muted small">{age(pre.evaluated_at)} · source snapshot {pre.source_snapshot}</span><span className="grow" /><button className="link" onClick={() => setPre(null)}>hide</button></div>
           <div className="row small">{Object.entries(pre.summary.readiness).map(([k, v]) => <span key={k} className="badge" title={k === 'toolchain' ? pre.toolchain?.note ?? '' : ''}>{k.replace('_', ' ')}: {String(v).replaceAll('_', ' ')}</span>)}</div>
           <ul>{pre.facts.map((f: any, i: number) => <li key={i} className={f.blocking ? '' : 'muted'}><b>{f.kind.replaceAll('_', ' ')}</b>: {f.detail}{f.paths?.length ? <div className="mono small">{f.paths.slice(0, 12).join('  ')}{f.paths.length > 12 ? ' …' : ''}</div> : null}</li>)}</ul>
-          <div className="small"><b>Plan ({pre.suggested_plan.kind.replaceAll('_', ' ')})</b> <span className="muted">— carried out by your AI agent through SSH, then verified here</span></div>
+          <div className="small"><b>Plan ({pre.suggested_plan.kind.replaceAll('_', ' ')})</b> <span className="muted">— {exec ? 'Sync now runs it here, or' : ''} carried out by your AI agent through SSH, then verified here</span></div>
           <ol className="small">{pre.suggested_plan.steps.map((s: string, i: number) => <li key={i}>{s}</li>)}</ol>
         </div>
       )}

@@ -407,3 +407,52 @@ test('toolchain: pubspec constraints, fvm pin and SDK versions on both sides (re
   writeFileSync(join(dir, '.fvmrc'), '{"flutter":"3.44.8"}');
   assert.ok(evaluateToolchain(projectRequirements(dir)!, pc, { flutter: '3.47.7', dart: '3.11.0' }).facts.some((f) => f.kind === 'toolchain_pin_mismatch'));
 });
+
+type Sync = { outcome: string; files_copied: number };
+const syncNow = (core: Core, project: { id: string }, loc: { id: string }) => core.syncProject({ project_id: project.id, destination_location_id: loc.id }) as Promise<Sync>;
+
+test('Sync now (GUI): uncommitted files, then fast-forward with new commits, verified; MCP output carries no exec', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  const { core, project, loc, pre } = setup(src, dst);
+  writeFileSync(join(src, 'a.txt'), 'wip\n');
+  writeFileSync(join(src, 'src', 'new.txt'), 'untracked\n');
+  assert.equal(((await pre()).suggested_plan as { exec?: unknown }).exec, undefined, 'agents never see exec');
+  let r = await syncNow(core, project, loc);
+  assert.equal(r.outcome, 'verified');
+  assert.equal(r.files_copied, 2);
+  assert.equal(readFileSync(join(dst, 'src', 'new.txt'), 'utf8'), 'untracked\n');
+
+  git(src, 'add', '-A');
+  git(src, 'commit', '-qm', 'second');
+  writeFileSync(join(src, 'later.txt'), 'after commit\n');
+  r = await syncNow(core, project, loc);
+  assert.equal(r.outcome, 'verified');
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.equal((await pre()).verdict, 'ready');
+  core.acquireLease({ location_id: loc.id, operation_id: 'next', owner: 'agent' }); // the GUI lease was released
+});
+
+test('Sync now refuses when the destination has its own commits, and changes nothing', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst);
+  writeFileSync(join(dst, 'a.txt'), 'mac only\n');
+  git(dst, 'commit', '-qam', 'mac-only commit');
+  const head = git(dst, 'rev-parse', 'HEAD');
+  git(src, 'commit', '-q', '--allow-empty', '-m', 'pc commit');
+  await assert.rejects(syncNow(core, project, loc), (e: { message: string }) => /nothing Sync now can do safely|Not possible to fast-forward/.test(e.message));
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), head);
+  assert.equal(readFileSync(join(dst, 'a.txt'), 'utf8'), 'mac only\n');
+});
+
+test('Sync now clones a missing create_if_missing destination', async () => {
+  const src = tempRepo();
+  const dst = join(mkdtempSync(join(tmpdir(), 'sshrm-dst-')), 'fresh');
+  const { core, project, loc } = setup(src, dst);
+  core.updateProjectLocation({ location_id: loc.id, expected_revision: loc.revision, patch: { mode: 'create_if_missing' }, idempotency_key: key() });
+  writeFileSync(join(src, 'wip.txt'), 'uncommitted\n');
+  assert.equal((await syncNow(core, project, loc)).outcome, 'verified');
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.equal(readFileSync(join(dst, 'wip.txt'), 'utf8'), 'uncommitted\n');
+});
