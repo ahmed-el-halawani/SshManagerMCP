@@ -112,7 +112,7 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
   const [adding, setAdding] = useState<string | null>(null); // host id for the New mapping dialog ('' = pick one)
   const [selSync, setSelSync] = useState<string | null>(null);
   const [selFile, setSelFile] = useState<string | null>(null);
-  const [show, setShow] = useState<'all' | 'dirty' | 'clean'>('all');
+  const [show, setShow] = useState<'all' | 'dirty' | 'clean' | 'kept'>('all');
   const [sideW, setSideW] = useState(() => Number(store.get('sideW')) || 260);
   const seq = useRef(0);
   // Drag the sidebar's right edge (double-click resets). The project toolbar item follows the same width, like GitHub Desktop.
@@ -145,11 +145,29 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
   };
   // Like GitHub Desktop fetching on open: picking a destination checks it (read-only over SSH).
   useEffect(() => { setPre(null); setNote(null); setErr(null); setSelSync(null); setSelFile(null); setCheckedAt(null); if (dest?.path_input) check(); }, [project?.id, dest?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Like GitHub Desktop: coming back to the window (after editing files here or on the host) re-checks, and so does a
+  // 2-minute tick while it is visible. Skipped while a check/sync runs or the last check is under 15 s old.
+  const latest = useRef({ check, busy, checkedAt, ok: !!dest?.path_input });
+  latest.current = { check, busy, checkedAt, ok: !!dest?.path_input };
+  useEffect(() => {
+    const auto = () => {
+      const l = latest.current;
+      if (document.visibilityState === 'visible' && l.ok && !l.busy && (!l.checkedAt || Date.now() - Date.parse(l.checkedAt) > 15_000)) l.check();
+    };
+    window.addEventListener('focus', auto); document.addEventListener('visibilitychange', auto);
+    const t = setInterval(auto, 120_000);
+    return () => { window.removeEventListener('focus', auto); document.removeEventListener('visibilitychange', auto); clearInterval(t); };
+  }, []);
 
-  const sync = async () => {
+  const sync = async (backup = false) => {
+    if (backup && !confirm(`${plural(dirtyCount, 'file')} on ${hostName} has edits this PC doesn't have.
+
+They will be saved in a git stash on ${hostName} (restore with "git stash pop" there), then this PC's version is synced.
+
+Continue?`)) return;
     setBusy('sync'); setErr(null); setNote(null);
     try {
-      const r = await call('syncProject', { project_id: project.id, destination_location_id: dest.id });
+      const r = await call('syncProject', { project_id: project.id, destination_location_id: dest.id, backup_host_changes: backup });
       setNote(`${OUTCOME[r.outcome]?.text ?? r.outcome}: ${r.note}`);
       hist.reload(); reload();
       await check();
@@ -162,13 +180,15 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
   // Changes list: every file that differs between this PC and the host. "Dirty" = the host's own work is on it
   // (uncommitted there, or in a commit made there): Sync never overwrites those.
   const allRows: FileRow[] = (pre?.files ?? []).map((f: any) => ({
-    p: f.path, m: f.status === 'modified' ? 'M' : f.status === 'added' ? 'A' : 'D', dirty: f.host_dirty || f.host_committed,
-    t: [f.status === 'modified' ? `differs from ${hostName}` : f.status === 'added' ? `not on ${hostName} yet` : `only on ${hostName}`,
+    p: f.path, m: f.status === 'kept' ? 'K' : f.status === 'modified' ? 'M' : f.status === 'added' ? 'A' : 'D', dirty: f.host_dirty || f.host_committed,
+    t: f.status === 'kept' ? `edited on ${hostName}, kept as is: this PC hasn't changed this file, so Sync leaves ${hostName}'s version alone` : [f.status === 'modified' ? `differs from ${hostName}` : f.status === 'added' ? `not on ${hostName} yet` : `only on ${hostName}`,
       f.host_dirty && `changed on ${hostName} and not committed there`, f.host_committed && `changed in a commit made on ${hostName}`,
       f.conflict && 'also changed on this PC (conflict)'].filter(Boolean).join(' · '),
   }));
   const dirtyCount = allRows.filter((r) => r.dirty).length;
-  const rows = show === 'dirty' ? allRows.filter((r) => r.dirty) : show === 'clean' ? allRows.filter((r) => !r.dirty) : allRows;
+  // Kept = files the sync never touches (host edits this PC didn't change, leftovers only on the host): hidden unless asked for.
+  const keptCount = allRows.filter((r) => r.m === 'K').length;
+  const rows = show === 'kept' ? allRows.filter((r) => r.m === 'K') : show === 'dirty' ? allRows.filter((r) => r.dirty) : allRows.filter((r) => r.m !== 'K' && (show === 'all' || !r.dirty));
   const selRow = allRows.find((r) => r.p === selFile);
   const kind = pre?.suggested_plan.kind as string | undefined;
   const commitStep: string | undefined = exec && kind ? ({ git_clone: 'Clone', git_switch: 'Switch to', git_fast_forward: 'Fast-forward' } as Record<string, string>)[kind] : undefined;
@@ -199,7 +219,7 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
         <ToolbarItem icon="▣" label="Current project" value={project?.name ?? '…'} open={menu === 'project'} onClick={() => setMenu(menu === 'project' ? null : 'project')} />
         <ToolbarItem icon="🖥" label="Current destination" value={dest ? `${hostName}${dest.label && dest.label !== host?.name ? ` · ${dest.label}` : ''}` : 'None'} open={menu === 'dest'} onClick={() => setMenu(menu === 'dest' ? null : 'dest')} />
         <ToolbarItem icon="⑂" label="Current branch" value={branch} />
-        <ToolbarItem icon={busy === 'check' ? '◌' : '⟳'} label="" value={busy === 'check' ? `Checking ${hostName}…` : `Check ${hostName}`} sub={checkedAt ? `Last checked ${age(checkedAt)}` : 'Not checked yet'}
+        <ToolbarItem icon={busy === 'check' ? '◌' : '⟳'} label="" value={busy === 'check' ? `Refreshing…` : `Refresh`} sub={checkedAt ? `Checked ${age(checkedAt)} · this PC and ${hostName}` : 'Not checked yet'}
           onClick={check} disabled={!!busy || !dest?.path_input} />
         {menu && <div className="gd-scrim" onClick={() => setMenu(null)} />}
         {menu === 'project' && (
@@ -245,32 +265,34 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
           </div>
           {tab === 'changes' ? (
             <>
-              <div className="gd-list-head">{pre ? plural(allRows.length, 'changed file') : busy === 'check' ? 'Checking…' : 'Not checked yet'}</div>
-              {pre && allRows.length > 0 && (
+              <div className="gd-list-head">{pre ? plural(allRows.length - keptCount, 'changed file') : busy === 'check' ? 'Checking…' : 'Not checked yet'}</div>
+              {pre && allRows.length > keptCount && (
                 <div className="gd-seg" role="radiogroup" aria-label="Show files">
-                  {([['all', 'All', allRows.length, 'Every file that differs'], ['dirty', 'Dirty', dirtyCount, `Changed on ${hostName} itself: Sync won't overwrite these`],
-                    ['clean', 'Not dirty', allRows.length - dirtyCount, `Only changed on this PC: safe to sync`]] as const).map(([k, label, n, tip]) => (
+                  {([['all', 'All', allRows.length - keptCount, 'Every file the sync would change or is blocked by'], ['dirty', 'Host edits', dirtyCount, `Edited on ${hostName} and this PC doesn't have that version: Sync won't overwrite them`],
+                    ['clean', 'From this PC', allRows.length - dirtyCount - keptCount, `${hostName} just has an older copy: Sync replaces it`]] as const).map(([k, label, n, tip]) => (
                     <button key={k} role="radio" aria-checked={show === k} className={show === k ? 'on' : ''} title={tip} onClick={() => setShow(k)}>{label} <span className="gd-seg-n">{n}</span></button>
                   ))}
                 </div>
               )}
+              {dirtyCount > 0 && <div className="gd-list-hint">! = edited on {hostName}; this PC doesn't have that version. Sync won't overwrite it unless you back it up first.</div>}
+              {keptCount > 0 && <button className="gd-list-hint link" onClick={() => setShow(show === 'kept' ? 'all' : 'kept')} title="Files only on the host, or host edits to files this PC hasn't changed: Sync leaves them as they are">⌂ {show === 'kept' ? 'Hide' : 'Show'} {plural(keptCount, 'file')} on {hostName} the sync leaves alone</button>}
               <div className="gd-list">
                 {commitLine && <div className="gd-file commit" title={`${pre.summary.source.head} → ${hostName}`}><span className="grow-1 ellipsis">⊶ {commitLine} → {pre.summary.source.head?.slice(0, 7)}</span><span className="gd-mark A">⇡</span></div>}
                 {rows.map((r) => (
                   <button key={r.p} className={`gd-file ${r.p === selFile ? 'sel' : ''}`} title={`${r.p}\n${r.t}`} onClick={() => setSelFile(r.p)}>
                     <span className="gd-path"><span className="gd-dir">{r.p.slice(0, r.p.lastIndexOf('/') + 1)}</span><span className="gd-name">{r.p.slice(r.p.lastIndexOf('/') + 1)}</span></span>
-                    {r.dirty && <span className="gd-mark dirty" title={`Dirty: changed on ${hostName}`}>!</span>}
-                    <span className={`gd-mark ${r.m}`}>{r.m === 'M' ? '•' : r.m === 'A' ? '+' : '−'}</span>
+                    {r.dirty && <span className="gd-mark dirty" title={`Edited on ${hostName}: this PC doesn't have that version`}>!</span>}
+                    <span className={`gd-mark ${r.m}`} title={r.m === 'K' ? `Kept: ${hostName}'s edit stays` : undefined}>{r.m === 'M' ? '•' : r.m === 'A' ? '+' : r.m === 'K' ? '⌂' : '−'}</span>
                   </button>
                 ))}
-                {pre && allRows.length > 0 && rows.length === 0 && <div className="gd-list-empty">No {show === 'dirty' ? 'dirty' : 'clean'} files.</div>}
+                {pre && allRows.length > keptCount && rows.length === 0 && <div className="gd-list-empty">{show === 'dirty' ? 'No host edits.' : 'Nothing that only this PC changed.'}</div>}
               </div>
               {/* GitHub Desktop's commit box → the sync box */}
               <div className="gd-commit">
-                <div className="gd-commit-sum">{exec ? [commitLine, exec.copy.length ? plural(exec.copy.length, 'uncommitted file') : ''].filter(Boolean).join(' + ') : pre ? (pre.verdict === 'ready' ? 'Already in sync' : 'Sync now can’t run this safely') : 'Check the host first'}</div>
+                <div className="gd-commit-sum">{exec ? [commitLine, exec.copy.length ? plural(exec.copy.length, 'uncommitted file') : ''].filter(Boolean).join(' + ') : pre ? (pre.verdict === 'ready' ? 'Already in sync' : pre.can_back_up ? `${plural(dirtyCount, 'host edit')} in the way` : 'Sync now can’t run this safely') : 'Check the host first'}</div>
                 <div className="gd-commit-desc">{pre ? <>This PC <b>{pre.summary.source.branch ?? 'no git'}</b> {pre.summary.source.head?.slice(0, 7)} → {hostName} <b>{pre.summary.destination.branch ?? (pre.summary.destination.head ? 'detached' : 'no git')}</b> {pre.summary.destination.head?.slice(0, 7)}</> : <span className="muted">Fast-forward only. Work on the host is never overwritten.</span>}</div>
-                <button className="primary gd-wide" disabled={!exec || !!busy} onClick={sync} title="Runs the plan over SSH, then re-reads both sides to verify">
-                  {busy === 'sync' ? 'Syncing…' : <>Sync to <b>{hostName}</b></>}
+                <button className="primary gd-wide" disabled={(!exec && !pre?.can_back_up) || !!busy} onClick={() => sync(!exec)} title="Runs the plan over SSH, then re-reads both sides to verify">
+                  {busy === 'sync' ? 'Syncing…' : !exec && pre?.can_back_up ? <>Back up {dirtyCount} &amp; sync</> : <>Sync to <b>{hostName}</b></>}
                 </button>
               </div>
             </>
@@ -294,7 +316,8 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
         {/* ── Main pane ────────────────────────────────────── */}
         <main className="gd-main">
           {tab === 'changes' && selRow ? (
-            <FileDiff key={selRow.p} projectId={project.id} destId={dest.id} row={selRow} hostName={hostName} onClose={() => setSelFile(null)} />
+            <FileDiff key={selRow.p} projectId={project.id} destId={dest.id} row={selRow} hostName={hostName} onClose={() => setSelFile(null)}
+              onIgnore={async (pattern) => { try { await call('editProjectIgnore', { project_id: project.id, add: [pattern] }); setSelFile(null); setNote(`Added “${pattern}” to .sshrmignore`); check(); } catch (e) { setErr(errText(e)); } }} />
           ) : tab === 'history' ? (
             selected ? <SyncDetail s={selected} /> : <div className="gd-blank"><h1>History</h1><p className="muted">Every verification after a transfer to {hostName} is listed on the left: the commit it was checked against and whether both sides matched.</p></div>
           ) : (
@@ -314,13 +337,16 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
                   {exec && (
                     <div className="gd-box blue"><div className="gd-row"><div><b>Sync your changes to {hostName}</b><div>{commitLine ? `${commitLine}${exec.copy.length ? ` and copy ${plural(exec.copy.length, 'uncommitted file')}` : ''}.` : `Copy ${plural(exec.copy.length, 'file')}.`}</div>
                       <div className="muted small">Fast-forward only: if {hostName} has its own commits or edits, Git refuses and nothing is overwritten.</div></div>
-                      <button className="primary" disabled={!!busy} onClick={sync}>{busy === 'sync' ? 'Syncing…' : 'Sync now'}</button></div></div>
+                      <button className="primary" disabled={!!busy} onClick={() => sync()}>{busy === 'sync' ? 'Syncing…' : 'Sync now'}</button></div></div>
                   )}
                   {pre && !exec && pre.verdict !== 'ready' && (
                     <div className="gd-box amber">
                       <b>Why it can't sync: {pre.verdict.replaceAll('_', ' ')}</b>
                       <ul>{pre.facts.filter((f: any) => f.blocking).map((f: any, i: number) => <li key={i}>{f.detail}</li>)}</ul>
-                      <div className="muted small">Resolve it on {hostName} (commit or discard the work there), then check again. Your AI agent can also follow the plan below.</div>
+                      {pre.can_back_up ? (
+                        <div className="gd-row"><div className="muted small">These are edits made on {hostName} that this PC doesn't have. Back them up into a git stash on {hostName} (get them back with <span className="mono">git stash pop</span>) and sync everything else.</div>
+                          <button className="primary" disabled={!!busy} onClick={() => sync(true)}>{busy === 'sync' ? 'Syncing…' : `Back up ${dirtyCount} & sync`}</button></div>
+                      ) : <div className="muted small">Resolve it on {hostName} (commit or discard the work there), then press Refresh. Your AI agent can also follow the plan below.</div>}
                     </div>
                   )}
                   <div className="gd-box list">
@@ -346,7 +372,7 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
   );
 }
 
-type FileRow = { p: string; m: 'M' | 'A' | 'D'; dirty: boolean; t: string };
+type FileRow = { p: string; m: 'M' | 'A' | 'D' | 'K'; dirty: boolean; t: string };
 type DiffLine = { k: 'hunk' | 'add' | 'del' | 'ctx'; o?: number; n?: number; t: string };
 
 function parseDiff(diff: string): DiffLine[] {
@@ -362,8 +388,10 @@ function parseDiff(diff: string): DiffLine[] {
 }
 
 /** GitHub Desktop's diff view: the host's copy is the old side (−), this PC is the new side (+). */
-function FileDiff({ projectId, destId, row, hostName, onClose }: { projectId: string; destId: string; row: FileRow; hostName: string; onClose: () => void }) {
+function FileDiff({ projectId, destId, row, hostName, onClose, onIgnore }: { projectId: string; destId: string; row: FileRow; hostName: string; onClose: () => void; onIgnore: (pattern: string) => void }) {
   const [d, setD] = useState<any>(null);
+  const [ign, setIgn] = useState(false);
+  const dir = row.p.slice(0, row.p.lastIndexOf('/') + 1), ext = /\.[^./]+$/.exec(row.p)?.[0];
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => { call('diffProjectFile', { project_id: projectId, destination_location_id: destId, path: row.p }).then(setD, (e) => setErr(errText(e))); }, [projectId, destId, row.p]);
   const lines = d?.diff ? parseDiff(d.diff) : d?.text != null ? d.text.split('\n').map((t: string, i: number) => ({ k: 'ctx', o: i + 1, n: i + 1, t })) : [];
@@ -376,6 +404,8 @@ function FileDiff({ projectId, destId, row, hostName, onClose }: { projectId: st
       <div className="gd-diff-head">
         <span className="gd-path"><span className="gd-dir">{row.p.slice(0, row.p.lastIndexOf('/') + 1)}</span><span className="gd-name">{row.p.slice(row.p.lastIndexOf('/') + 1)}</span></span>
         {d?.diff && <span className="gd-diff-stat"><span className="add">+{adds}</span> <span className="del">−{dels}</span></span>}
+        {ign ? <span className="gd-ignore">Ignore: <button className="ghost" onClick={() => onIgnore(row.p)}>this file</button>{dir && <button className="ghost" onClick={() => onIgnore(dir)}>{dir}</button>}{ext && <button className="ghost" onClick={() => onIgnore(`*${ext}`)}>all *{ext}</button>}<button className="ghost" onClick={() => setIgn(false)}>Cancel</button></span>
+          : <button className="ghost" onClick={() => setIgn(true)} title="Add to .sshrmignore: Sync and the check leave it out on both sides">Ignore…</button>}
         <button className="ghost" onClick={onClose} title="Back to overview">✕</button>
       </div>
       <div className={`gd-diff-sub ${row.dirty ? 'dirty' : ''}`}>{row.dirty ? '! ' : ''}{row.t} <span className="muted">· <span className="del">−</span> {hostName} · <span className="add">+</span> this PC</span></div>

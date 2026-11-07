@@ -36,6 +36,30 @@ const getLocationRow = (db: DB, id: string) => {
   return r;
 };
 const policyOf = (l: LocationRow) => ConsistencyPolicy.parse(JSON.parse(l.consistency_policy_json));
+
+/** The project's own ignore list, `.sshrmignore` in the source folder: gitignore-style lines, but for this app's compare and sync only. */
+export const IGNORE_FILE = '.sshrmignore';
+/** gitignore lines -> globs. `name` matches at any depth, `a/b` or `/a` from the project root, `dir/` only folders. `!` is not supported. */
+export function ignoreGlobs(text: string) {
+  return text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#') && !l.startsWith('!')).flatMap((l) => {
+    const dir = l.endsWith('/');
+    const p = l.replace(/\/+$/, '');
+    const base = p.includes('/') ? p.replace(/^\/+/, '') : `**/${p}`;
+    return !p ? [] : dir ? [`${base}/**`] : [base, `${base}/**`];
+  });
+}
+/** The folder on this PC this setup syncs from (null: source on a host), which holds `.sshrmignore`. */
+function sourceDirOf(db: DB, l: LocationRow) {
+  const id = l.role === 'source' ? l.id : l.source_location_id ?? getProjectRow(db, l.project_id).source_location_id;
+  const s = id ? getLocationRow(db, id) : null;
+  return s && !s.host_id ? s.canonical_path ?? s.path_input : null;
+}
+const readIgnore = (dir: string | null) => { try { return dir ? readFileSync(join(dir, IGNORE_FILE), 'utf8') : ''; } catch { return ''; } };
+/** Location policy plus the project's `.sshrmignore`: ignored paths drop out of both sides' listings, so nothing compares, copies or blocks on them. */
+const effectivePolicy = (db: DB, l: LocationRow) => {
+  const p = policyOf(l);
+  return { ...p, exclusions: [...p.exclusions, ...ignoreGlobs(readIgnore(sourceDirOf(db, l)))] };
+};
 const sha = (s: string | Buffer) => createHash('sha256').update(s).digest('hex');
 
 function validatePath(path: string, flavor: 'windows' | 'posix') {
@@ -532,7 +556,7 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
 }
 
 async function inspectLocation(ctx: Ctx, project: ProjectRow, l: LocationRow): Promise<{ id: string; inspection: Inspection; snapshot_id: string | null }> {
-  const policy = policyOf(l);
+  const policy = effectivePolicy(ctx.db, l);
   const gen = l.location_generation;
   let insp: Inspection;
   if (!l.path_input) insp = { path_state: 'unset', layout_issues: [], stable: true };
@@ -728,12 +752,17 @@ function verifiedBaseline(db: DB, dest: LocationRow, srcId: string) {
   return { same_source: v.source_location_id === srcId, src: hashes(ev.source_inspection_id), dst: hashes(ev.destination_inspection_id), dst_head: dstHead };
 }
 
-function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, src: Inspection, dst: Inspection, policy: ConsistencyPolicy) {
+/**
+ * `known`: destination blob ids this PC's source repo already holds. That content is in the source's history (an older
+ * version, a line-ending-only change, a host reset to an old commit), so replacing it on the host loses nothing.
+ */
+function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, src: Inspection, dst: Inspection, policy: ConsistencyPolicy, { known, atHead }: SourceKnowledge = NO_KNOWLEDGE) {
   const facts: Fact[] = [];
   const add = (kind: string, detail: string, paths?: string[], blocking = true) => facts.push({ kind, blocking, detail, ...(paths ? { paths: paths.slice(0, 50) } : {}) });
   const diff = { missing: [] as string[], changed: [] as string[], extra_owned: [] as string[], extra_unknown: [] as string[], filtered_only: [] as string[],
     since_verified_sync: null as null | { local_only: string[]; remote_only: string[]; both: string[] },
-    dest_uncommitted: [] as string[], dest_committed: [] as string[] }; // full (unsliced) at-risk lists, for the GUI file list
+    dest_uncommitted: [] as string[], dest_committed: [] as string[], // full (unsliced) at-risk lists, for the GUI file list
+    restorable: [] as string[], already_in_source: 0, kept: [] as string[] }; // host-dirty paths Sync may put back to HEAD first (their content is never lost)
   if (dst.path_state === 'unset') { add('path_unset', 'destination path is not set'); return { facts, diff }; }
   if (src.path_state !== 'exists') { add('path_missing', `source path state: ${src.path_state}`); return { facts, diff }; }
   if (dst.error) { add('needs_recheck', `${dst.error.code}: ${dst.error.message}`); return { facts, diff }; }
@@ -782,7 +811,21 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
   if (diff.filtered_only.length) {
     add('filter_only_differences', `${diff.filtered_only.length} file(s) differ only in bytes Git normalises (line endings / clean filters); compared by Git blob id, same content`, diff.filtered_only, false);
   }
+  // Host edits the sync never touches: this PC's version is still the one in the host's own commit (same blob, or absent on
+  // both), so the incoming commits leave the path alone and Git keeps the host's copy. Left as they are; they don't block.
+  for (const list of [diff.changed, diff.extra_unknown]) {
+    for (let i = list.length - 1; i >= 0; i--) {
+      const p = list[i], d = dm.get(p);
+      if (d?.g && (!known.has(d.g) || !sm.has(p)) && atHead.has(p) && (sm.get(p)?.g ?? null) === atHead.get(p)) { diff.kept.unshift(p); list.splice(i, 1); }
+    }
+  }
+  if (diff.kept.length) add('host_edits_kept', `${diff.kept.length} file(s) edited on the destination that this PC has not changed since the destination's commit; sync leaves them as they are`, diff.kept, false);
   const differing = [...diff.changed, ...diff.missing, ...diff.extra_owned, ...diff.extra_unknown];
+  // Host work is only what this PC can't recreate: a deleted file or content the source repo already has is not.
+  // Host work = content this PC can't recreate. Bytes identical to this PC's working copy (e.g. a file an agent copied with
+  // Windows line endings, which gets another Git blob id there) are not: nothing is lost by replacing them.
+  const hostOwn = (p: string) => { const d = dm.get(p); return !!d && !(d.g && known.has(d.g)) && sm.get(p)?.h !== d.h; };
+  let atRiskAll: string[] = [];
   if (base) {
     // Who changed what since the manager last verified this setup. Uncommitted files we synced are not
     // someone else's work; a destination file that no longer matches what we verified there is.
@@ -794,7 +837,10 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
     }
     diff.since_verified_sync = since;
     if (differing.length) add('changes_since_verified_sync', `since the last verified sync: ${since.local_only.length} changed on source only, ${since.remote_only.length} on destination only, ${since.both.length} on both`, undefined, false);
-    const atRisk = [...since.both, ...since.remote_only];
+    const touched = [...since.both, ...since.remote_only];
+    const atRisk = touched.filter(hostOwn);
+    diff.already_in_source = touched.length - atRisk.length;
+    atRiskAll = atRisk;
     // Uncommitted work vs commits made on the destination: both must not be overwritten, but they are fixed differently.
     // A truncated dirty list cannot prove a path clean: treat it as uncommitted (the safe side).
     const dirtyList = new Set(dg?.dirty_paths ?? []);
@@ -805,19 +851,62 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
     const headMoved = !dg?.is_repo || !base.dst_head || dg.head !== base.dst_head;
     const committed = headMoved ? atRisk.filter((p) => !uncommitted.includes(p)) : [];
     diff.dest_uncommitted = uncommitted; diff.dest_committed = committed;
-    const conflictNote = since.both.length ? ` (${since.both.length} also changed on source = conflict)` : '';
+    const conflicts = since.both.filter(hostOwn).length;
+    const conflictNote = conflicts ? ` (${conflicts} also changed on source = conflict)` : '';
     if (uncommitted.length) add('destination_dirty', `${uncommitted.length} file(s) changed on the destination after the last verified sync and are not committed there${conflictNote}; copying would overwrite that work`, uncommitted);
     if (committed.length) add('destination_ahead', `${committed.length} file(s) changed in commits made on the destination after the last verified sync (destination ${dg?.head?.slice(0, 12)} vs source ${sg?.head?.slice(0, 12)})${conflictNote}; the working tree there is clean, so git status shows nothing`, committed);
   } else {
-    const destDirtyAtRisk = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
-    diff.dest_uncommitted = destDirtyAtRisk;
+    const dirtyDiffering = (dg?.dirty_paths ?? []).filter((p) => diff.changed.includes(p) || diff.extra_unknown.includes(p));
+    const destDirtyAtRisk = dirtyDiffering.filter(hostOwn);
+    diff.already_in_source = dirtyDiffering.length - destDirtyAtRisk.length;
+    diff.dest_uncommitted = atRiskAll = destDirtyAtRisk;
     if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten (no verified sync yet to tell who changed it)', destDirtyAtRisk);
   }
+  if (dg?.is_repo) {
+    // Dirty on the host but not its own work: in scope here, and its content is either the source's or in the source's history.
+    const risk = new Set([...atRiskAll, ...diff.kept]);
+    diff.restorable = underSubdir(dg.dirty_paths, dg.subdir).filter((p) => dm.has(p) && !risk.has(p) && (sm.has(p) || !hostOwn(p)));
+  }
+  if (diff.already_in_source) add('host_has_old_source_content', `${diff.already_in_source} file(s) changed on the destination hold content this PC's repository already has (older versions or line endings only); safe to replace`, undefined, false);
   if (diff.missing.length || diff.changed.length || diff.extra_owned.length || diff.extra_unknown.length) {
     add('content_mismatch', `missing ${diff.missing.length}, changed ${diff.changed.length}, stale-owned ${diff.extra_owned.length}, unknown extra ${diff.extra_unknown.length}`,
       [...diff.changed, ...diff.missing, ...diff.extra_owned, ...diff.extra_unknown]);
   }
   return { facts, diff };
+}
+
+/** What the local source repository knows about the destination's differing files (empty when the source isn't on this PC). */
+type SourceKnowledge = { known: Set<string>; atHead: Map<string, string | null> };
+const NO_KNOWLEDGE: SourceKnowledge = { known: new Set(), atHead: new Map() };
+
+/**
+ * known: destination blob ids the source repo already has as objects. atHead: for the rest (host-only content), the blob
+ * of that path in the destination's HEAD commit (null = not in it), read from the source repo when it has that commit.
+ */
+async function sourceKnowledge(ctx: Ctx, src: Inspection, dst: Inspection): Promise<SourceKnowledge> {
+  if (src.home || !src.git?.is_repo || !src.canonical_path || !dst.git?.is_repo) return NO_KNOWLEDGE; // only a source on this PC can be asked
+  const sm = new Map(src.manifest?.entries.map((e) => [e.p, e.g]));
+  const differing = (dst.manifest?.entries ?? []).filter((e) => e.g && sm.get(e.p) !== e.g);
+  if (!differing.length) return NO_KNOWLEDGE;
+  const s = getSettings(ctx.db);
+  const batch = async (lines: string[]) => {
+    const r = await run(splitCommand(s.git_path), ['cat-file', '--batch-check'], { cwd: src.canonical_path!, input: lines.join('\n') + '\n', timeoutMs: s.inspect_timeout_s * 1000, maxBytes: 64 << 20 });
+    return r.exit_code === 0 ? r.stdout.split('\n').slice(0, lines.length) : null; // can't tell: everything stays the host's own work (the safe side)
+  };
+  const ids = [...new Set(differing.map((e) => e.g!))];
+  const out = await batch(ids);
+  if (!out) return NO_KNOWLEDGE;
+  const known = new Set(out.filter((l) => / blob \d+$/.test(l)).map((l) => l.slice(0, l.indexOf(' '))));
+  const atHead = new Map<string, string | null>();
+  // GUI Sync now only: agents keep the strict view (any host edit blocks a build from "ready").
+  const head = ctx.source === 'gui' ? dst.git.head : null;
+  // Unknown content, plus host-only files (even old content this PC has): the sync leaves either alone if the host's commit agrees.
+  const unknown = differing.filter((e) => (!known.has(e.g!) || !sm.has(e.p)) &&!/[\r\n]/.test(e.p));
+  if (head && unknown.length && ((await batch([head]))?.[0] ?? '').match(/ commit \d+$/)) {
+    const r = await batch(unknown.map((e) => `${head}:./${e.p}`)); // ./ = relative to the project folder (a repo subfolder)
+    r?.forEach((l, i) => atHead.set(unknown[i].p, / blob \d+$/.test(l) ? l.slice(0, l.indexOf(' ')) : null));
+  }
+  return { known, atHead };
 }
 
 function verdictOf(facts: Fact[]) {
@@ -834,20 +923,20 @@ const REMOTE_BUNDLE = '/tmp/sshrm-sync.bundle';
  */
 function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, root: string, policy: ConsistencyPolicy, dst?: Inspection, diff?: ReturnType<typeof compare>['diff']) {
   const branch = src.git!.branch!;
-  // Uncommitted files a previous sync copied here (unchanged since; anything edited here is destination_dirty and never
-  // reaches this plan). Once the source commits them, git refuses to fetch/switch over them, so put them back first.
-  const touched = new Set([...(diff?.since_verified_sync?.remote_only ?? []), ...(diff?.since_verified_sync?.both ?? [])]);
-  const synced = dst?.git && diff?.since_verified_sync ? underSubdir(dst.git.dirty_paths, dst.git.subdir).filter((p) => !touched.has(p)) : [];
+  // Host-dirty files that are not the host's own work (copies a previous sync made, old source versions, line-ending noise).
+  // Git refuses to fetch/switch over them, so put them back first; the incoming commits and copies bring the source's version.
+  const synced = diff?.restorable ?? [];
   const local = src.canonical_path ?? '<source>';
-  const bundle = process.platform === 'win32' ? '$env:TEMP\\sshrm-sync.bundle' : '/tmp/sshrm-sync.bundle';
+  const bundle = join(tmpdir(), 'sshrm-sync.bundle').replaceAll('\\', '/'); // a literal path: PowerShell, cmd and Git Bash all accept it
   const inScope = new Set(src.manifest?.entries.map((e) => e.p));
-  const copy = underSubdir(src.git!.dirty_paths, src.git!.subdir).filter((p) => inScope.has(p));
+  const keep = new Set(diff?.kept);
+  const copy = underSubdir(src.git!.dirty_paths, src.git!.subdir).filter((p) => inScope.has(p) && !keep.has(p));
   const r = posixQuote(root);
   const { cmd: crlf, files: lf } = crlfFix(src, copy, r);
   const gone = goneInSource(src, policy);
   const del = gone.length ? `cd ${r} && rm -f -- ${gone.slice(0, 200).map(posixQuote).join(' ')}` : '';
   const apply = (b: string) => ({
-    clone: `git clone -q -b ${branch} ${b} ${r}`,
+    clone: `git clone -q -b ${branch} ${b} ${r} && git -C ${r} remote remove origin`, // origin would point at the deleted bundle
     switch: `git -C ${r} fetch -q ${b} ${branch}:${branch} && git -C ${r} switch -q ${branch}`,
     fast_forward: `git -C ${r} fetch -q ${b} ${branch} && git -C ${r} merge -q --ff-only FETCH_HEAD`,
   }[kind]);
@@ -898,7 +987,7 @@ function crlfFix(src: Inspection, copy: string[], r: string) {
   return { files: crlf, cmd: crlf.length ? `cd ${r} && perl -pi -e 's/\\r$//' -- ${crlf.slice(0, 200).map(posixQuote).join(' ')}` : '' };
 }
 
-function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: LocationRow, diff: ReturnType<typeof compare>['diff']) {
+function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: LocationRow, diff: ReturnType<typeof compare>['diff'], policy: ConsistencyPolicy) {
   const root = dst.canonical_path ?? dest.path_input ?? '<path>';
   const steps: string[] = [];
   const srcGit = !!src.git?.is_repo && !!src.git.branch;
@@ -908,7 +997,7 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
     case 'path_unset': return { kind: 'set_path', steps: ['Ask the user for the destination path, then update_project_location. Do not invent one.'] };
     case 'path_missing': return dest.mode !== 'create_if_missing'
       ? { kind: 'fix_path', steps: ['The adopted path does not exist. Ask the user for the correct existing path, or switch mode to create_if_missing explicitly.'] }
-      : srcGit ? gitPlan('clone', src, root, policyOf(dest))
+      : srcGit ? gitPlan('clone', src, root, policy)
       : { kind: 'create_then_transfer', steps: [`With the user's explicit choice: mkdir -p ${posixQuote(root)} via ssh`, 'Transfer the source scope', 'verify_project_sync'] };
     case 'wrong_repository': return { kind: 'rebind', steps: ['Do not modify this folder. Ask the user for the correct checkout path, or confirm identity explicitly if this really is a fork (update_project_location confirm_identity).'] };
     case 'conflicts_present': return { kind: 'manual', steps: ['Resolve merge conflicts with the user. Never reset, clean, or checkout --force automatically.'] };
@@ -921,9 +1010,9 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
         `To sync instead, bring those commits to the source first: on the destination 'git bundle create ahead.bundle ${s}..HEAD', copy it to the source, 'git fetch ahead.bundle HEAD' and merge there. Never overwrite them.`] };
     }
     case 'branch_mismatch': return bothGit
-      ? gitPlan('switch', src, root, policyOf(dest), dst, diff)
+      ? gitPlan('switch', src, root, policy, dst, diff)
       : { kind: 'choose_checkout', steps: ['Prefer another existing checkout/worktree on the right branch, or (if destination is clean and the user agrees) git switch <branch> there. Do not force a branch to match names.'] };
-    case 'revision_mismatch': if (bothGit) return gitPlan('fast_forward', src, root, policyOf(dest), dst, diff);
+    case 'revision_mismatch': if (bothGit) return gitPlan('fast_forward', src, root, policy, dst, diff);
       steps.push(
       `Move commits without a cloud remote: on source 'git bundle create sync.bundle ${dst.git?.head ? `${dst.git.head.slice(0, 12)}..` : ''}${src.git?.branch ?? 'HEAD'}', scp it, then on destination 'git fetch sync.bundle ${src.git?.branch ?? 'HEAD'}' and 'git merge --ff-only FETCH_HEAD'.`,
       'If --ff-only fails the destination is ahead/diverged: stop and ask the user.');
@@ -934,10 +1023,11 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
       const copy = [...diff.changed, ...diff.missing];
       // GUI "Sync now": only Git on both sides, nothing unknown on the destination, lists not truncated.
       // "Unknown" destination files the source deleted without committing are tracked and clean there (same HEAD): removable.
-      const gone = new Set(goneInSource(src, policyOf(dest)));
+      const gone = new Set(goneInSource(src, policy));
       const dstDirty = new Set(dst.git?.dirty_paths ?? []);
       const execOk = bothGit && verdict === 'content_mismatch' && diff.extra_unknown.every((p) => gone.has(p) && !dstDirty.has(p));
       const r = posixQuote(root);
+      const crlf = bothGit ? crlfFix(src, copy, r).cmd : '';
       return {
         ...(execOk ? { exec: { local: src.canonical_path ?? '<source>', root, host: [], restore: [], copy, lf: crlfFix(src, copy, r).files, remove: [...diff.extra_owned, ...diff.extra_unknown] } as SyncExec } : {}),
         kind: 'incremental_transfer',
@@ -946,6 +1036,7 @@ function suggestPlan(verdict: string, src: Inspection, dst: Inspection, dest: Lo
         steps: [...steps, 'acquire_project_lease', 'Copy only the listed files (scp per file or an archive of them); no rsync --delete, never copy .git.',
           diff.extra_owned.length ? 'Delete the stale-owned files listed (they were synced before and no longer exist in source).' : '',
           diff.extra_unknown.length ? 'Unknown destination files were not created by sync: ask the user, add an exclusion, or remove them deliberately. They block ready.' : '',
+          crlf ? `host: ${crlf}  # REQUIRED right after copying: these files have Windows line endings on this PC but Git stores them with LF; verify only matches after this` : '',
           'verify_project_sync with the expected_source_snapshot, then release_project_lease'].filter(Boolean),
       };
     }
@@ -977,8 +1068,9 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
   const { project, src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
   const s = await inspectLocation(ctx, project, src);
   const d = await inspectLocation(ctx, getProjectRow(ctx.db, project.id), dest);
-  const policy = policyOf(dest);
-  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, policy);
+  const policy = effectivePolicy(ctx.db, dest);
+  const known = await sourceKnowledge(ctx, s.inspection, d.inspection);
+  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, policy, known);
   if (input.expected_source_snapshot && input.expected_source_snapshot !== s.snapshot_id) facts.push({ kind: 'source_changed', blocking: true, detail: `source snapshot is now ${s.snapshot_id}, expected ${input.expected_source_snapshot}` });
   const lease = leaseInfo(ctx.db, dest.id);
   if (lease) facts.push({ kind: 'lease_held', blocking: false, detail: `an operation lease is held: ${JSON.stringify(lease)}` });
@@ -998,7 +1090,7 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
   const readiness = { connection: !dest.host_id ? 'local' : connectionFailed ? 'failed' : 'ok', files: verdict === 'ready' ? 'in_sync' : verdict,
     toolchain: toolchain.state, device: 'not_checked', test_tool: 'not_checked' };
   const toolsOk = !wantsTools || !['missing', 'incompatible'].includes(toolchain.state);
-  const plan = suggestPlan(verdict, s.inspection, d.inspection, dest, diff);
+  const plan = suggestPlan(verdict, s.inspection, d.inspection, dest, diff, policy);
   const full = input.detail === 'full';
   const side = (l: LocationRow, r: typeof s) => ({ ...(full ? { location_id: l.id, host_id: l.host_id } : {}), label: l.label, path: r.inspection.canonical_path ?? l.path_input,
     branch: r.inspection.git?.branch ?? null, head: r.inspection.git?.head?.slice(0, 12) ?? null,
@@ -1013,9 +1105,12 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
   const execution = { basis: input.basis, verdict: runVerdict, commit: (input.basis === 'source' ? s : d).inspection.git?.head ?? null,
     branch: (input.basis === 'source' ? s : d).inspection.git?.branch ?? null,
     ...(input.basis === 'destination' ? { note: 'Runs the destination as it is. Do not transfer files; record this commit as what was built.' } : {}) };
+  // The plan can be run by the manager itself (ssh_projects_sync): one call instead of bundle + scp + ssh + line endings + verify.
+  const oneCall = input.basis === 'source' && !!(plan as { exec?: unknown }).exec && !!dest.host_id && !src.host_id;
   const next = input.basis === 'destination' && runVerdict === 'ready'
     ? `Run from ${d.inspection.canonical_path} at ${execution.commit?.slice(0, 12) ?? 'its current state'} without transferring files (sync verdict is ${verdict}).`
-    : runVerdict === 'ready' && !toolsOk ? `Toolchain ${toolchain.state}: ${toolchain.facts[0]?.detail ?? toolchain.state}` : plan.steps[0];
+    : runVerdict === 'ready' && !toolsOk ? `Toolchain ${toolchain.state}: ${toolchain.facts[0]?.detail ?? toolchain.state}`
+    : oneCall ? 'Call ssh_projects_sync (same ids): it runs this whole plan in one step and verifies. The steps below are the manual equivalent.' : plan.steps[0];
   const t = now();
   // summary: counts plus a few paths per blocking fact; detail:"full" keeps every list, ids and the raw inspections.
   // Everything static (what verdict/execution/readiness mean) lives in the tool description, not in every response.
@@ -1028,10 +1123,10 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
       since_verified_sync: diff.since_verified_sync && Object.fromEntries(Object.entries(diff.since_verified_sync).map(([k, v]) => [k, v.length])), lease, next_step: next },
     facts: facts.map(compact), source_snapshot: s.snapshot_id, destination_snapshot: d.snapshot_id,
     generations: { source: src.location_generation, destination: dest.location_generation },
-    ...(ctx.source === 'gui' ? { files: fileList(diff) } : {}),
+    ...(ctx.source === 'gui' ? { files: fileList(diff), can_back_up: canBackUp(facts, diff, d.inspection) } : {}),
     ...(full ? { evidence_refs: { source_inspection_id: s.id, destination_inspection_id: d.id }, evaluated_at: t } : {}),
     ready_until: readyForIntent ? new Date(Date.now() + policy.readiness_max_age_seconds * 1000).toISOString() : null,
-    suggested_plan: ctx.source === 'gui' ? plan : { ...plan, exec: undefined }, toolchain: toolchainOut, // the plan is never shortened: its copy list is what the agent transfers
+    suggested_plan: ctx.source === 'gui' ? plan : { ...plan, exec: undefined, ...(oneCall ? { one_call: 'ssh_projects_sync' } : {}) }, toolchain: toolchainOut, // the plan is never shortened: its copy list is what the agent transfers
     ...(full ? { source: summarize(s), destination: summarize(d) } : {}),
   };
 }
@@ -1063,7 +1158,7 @@ export async function verifyProjectSync(ctx: Ctx, raw: unknown) {
     return { verification_id: id, outcome: 'needs_recheck', reason: 'source changed after preflight; the transferred content may be stale', source_snapshot: s.snapshot_id };
   }
   const d = await inspectLocation(ctx, project, dest);
-  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, policyOf(dest));
+  const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, effectivePolicy(ctx.db, dest), await sourceKnowledge(ctx, s.inspection, d.inspection));
   const verdict = verdictOf(facts);
   const matched = s.inspection.manifest!.count - diff.missing.length - diff.changed.length;
   const outcome = verdict === 'ready' ? 'verified' : d.inspection.error ? 'needs_recheck' : matched > 0 && matched < s.inspection.manifest!.count ? 'partial' : 'failed';
@@ -1078,39 +1173,65 @@ export async function verifyProjectSync(ctx: Ctx, raw: unknown) {
  * non-fast-forward updates, and preflight offers no exec when the destination is dirty, ahead or has unknown files.
  */
 export async function syncProject(ctx: Ctx, raw: unknown) {
-  const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid() }).strict().parse(raw);
+  const input = z.object({ project_id: z.uuid(), destination_location_id: z.uuid(), backup_host_changes: z.boolean().default(false) }).strict().parse(raw);
   const { src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
   if (!dest.host_id || src.host_id) throw new AppError('VALIDATION_ERROR', 'Sync now copies from a source on this PC to a remote host');
-  const op = `gui-sync-${randomUUID()}`;
-  acquireLease(ctx, { location_id: dest.id, operation_id: op, owner: 'gui', ttl_seconds: 900 });
+  const owner = ctx.source === 'gui' ? 'gui' : 'agent'; // agents call it as ssh_projects_sync
+  const op = `${owner}-sync-${randomUUID()}`;
+  acquireLease(ctx, { location_id: dest.id, operation_id: op, owner, ttl_seconds: 900 });
   const tmp = mkdtempSync(join(tmpdir(), 'sshrm-sync-'));
+  const s = getSettings(ctx.db);
+  const host = getHostRow(ctx.db, dest.host_id);
+  const preflight = () => preflightProject({ ...ctx, source: 'gui' }, { project_id: input.project_id, destination_location_id: dest.id, intent: 'transfer' });
   try {
-    const pre = await preflightProject({ ...ctx, source: 'gui' }, { ...input, intent: 'transfer' });
-    const exec = (pre.suggested_plan as { exec?: SyncExec }).exec;
-    if (!exec) throw new AppError('VALIDATION_ERROR', `nothing Sync now can do safely (verdict ${pre.verdict})`, { next_action: pre.summary.next_step });
-    const s = getSettings(ctx.db);
-    const host = getHostRow(ctx.db, dest.host_id);
     const remote = async (script: string, input: Buffer, what: string) => {
       const r = await sshRun(ctx, host, script, s.inspect_timeout_s, { input, maxBytes: 64 << 10 });
-      if (r.exit_code === 0) return;
+      if (r.exit_code === 0) return r.stdout;
       const refused = /fast-forward|non-fast-forward|would be overwritten/i.test(r.stderr);
-      throw new AppError(r.exit_code === 255 ? classify(r).code : 'REMOTE_COMMAND_FAILED', `${what} failed (exit ${r.exit_code}): ${sanitize(r.stderr).slice(0, 400)}`,
-        { details: { diagnostics: diagnostics(r) }, next_action: refused ? 'The destination changed since preflight (own commits or edits). Run Preflight again; nothing was overwritten.' : 'Run Preflight again to see the current state.' });
+      // Git's own lines first ("fatal: ..."), its multi-line "hint:" advice dropped: the reason must survive the cut.
+      const why = sanitize(r.stderr).split('\n').filter((l) => l.trim() && !l.startsWith('hint:')).join('\n').slice(0, 400);
+      throw new AppError(r.exit_code === 255 ? classify(r).code : 'REMOTE_COMMAND_FAILED',
+        refused ? `${what} refused by git, nothing was overwritten: the host branch has commits this PC does not have (or edits in the way). ${why}` : `${what} failed (exit ${r.exit_code}): ${why}`,
+        { details: { diagnostics: diagnostics(r), ...(refused ? { verdict: 'destination_ahead' } : {}) },
+          next_action: refused ? 'Show the user the host\'s own commits (preflight facts / git log on the host) and ask; never force. To build what is on the host as it is, preflight with basis:"destination".' : 'Run preflight again to see the current state.' });
     };
-    const local = async (cmd: string[], args: string[], what: string) => {
-      const r = await run(cmd, args, { cwd: exec.local, timeoutMs: s.inspect_timeout_s * 1000 });
+    const local = async (cmd: string[], args: string[], what: string, cwd: string) => {
+      const r = await run(cmd, args, { cwd, timeoutMs: s.inspect_timeout_s * 1000 });
       if (r.exit_code !== 0) throw new AppError('INTERNAL_ERROR', `${what} failed: ${sanitize(r.stderr).slice(0, 400)}`);
     };
-    const r = posixQuote(exec.root);
     // Path lists travel NUL-separated on stdin (xargs -0), never on the command line: Windows caps it at 32K characters.
     const list = (paths: string[]) => Buffer.from(paths.map((p) => `${p}\0`).join(''));
+    let pre = await preflight();
+    let backup: { stashed: number; message: string } | null = null;
+    const branches = { updated: [] as string[], skipped: [] as string[] };
+    if (!(pre.suggested_plan as { exec?: SyncExec }).exec && input.backup_host_changes && ctx.source === 'gui' && pre.can_back_up) {
+      // The host's own uncommitted files go into a git stash there (git stash list / git stash pop), never deleted.
+      const mine = (pre.files ?? []).filter((f) => f.host_dirty).map((f) => f.path);
+      const message = `SSH Resource Manager backup before sync ${now()}`;
+      const root = posixQuote(pre.summary.destination.path ?? '');
+      const who = 'git config user.email >/dev/null || export GIT_AUTHOR_NAME="SSH Resource Manager" GIT_AUTHOR_EMAIL=sshrm@localhost GIT_COMMITTER_NAME="SSH Resource Manager" GIT_COMMITTER_EMAIL=sshrm@localhost';
+      await remote(`cd ${root} && ${who}; git stash push -q --include-untracked -m ${posixQuote(message)} --pathspec-from-file=- --pathspec-file-nul`, list(mine), 'backing up host changes');
+      backup = { stashed: mine.length, message };
+      pre = await preflight();
+    }
+    const exec = (pre.suggested_plan as { exec?: SyncExec }).exec;
+    if (!exec) throw new AppError('VALIDATION_ERROR', `nothing Sync now can do safely (verdict ${pre.verdict})${backup ? ` after backing up ${backup.stashed} host file(s) into git stash "${backup.message}"` : ''}`, { next_action: pre.summary.next_step,
+      details: { verdict: pre.verdict, blocking: pre.facts.filter((f) => f.blocking).map((f) => ({ kind: f.kind, detail: f.detail, paths: f.paths?.slice(0, 10) })) } });
+    const r = posixQuote(exec.root);
     if (exec.restore.length) {
       await remote(`cd ${r} && xargs -0 sh -c 'for p; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done' _`, list(exec.restore), 'restoring previously synced copies');
     }
     if (exec.branch) {
       const b = join(tmp, 'sync.bundle');
-      await local(splitCommand(s.git_path), ['bundle', 'create', '-q', b, exec.branch], 'git bundle');
-      await remote(`B=$(mktemp) && cat > "$B" && ${exec.host.join(' && ')}; rc=$?; rm -f "$B"; exit $rc`, readFileSync(b), 'updating the destination checkout');
+      // Every local branch and tag rides along. The checked-out one moves via exec.host (fast-forward only); the others are
+      // fetched one by one: git itself refuses a non-fast-forward or a branch checked out on the host, which we report, never force.
+      await local(splitCommand(s.git_path), ['bundle', 'create', '-q', b, exec.branch, '--branches', '--tags'], 'git bundle', exec.local);
+      const others = `git -C ${r} bundle list-heads "$B" | while read -r sha ref; do case "$ref" in refs/heads/*) n=\${ref#refs/heads/}; ` +
+        `[ "$n" = ${posixQuote(exec.branch)} ] && continue; [ "$(git -C ${r} rev-parse -q --verify "$ref")" = "$sha" ] && continue; ` +
+        `if git -C ${r} fetch -q "$B" "$ref:$ref" 2>/dev/null; then echo "sshrm-updated $n"; else echo "sshrm-skipped $n"; fi;; esac; done; ` +
+        `git -C ${r} fetch -q "$B" 'refs/tags/*:refs/tags/*' 2>/dev/null || echo "sshrm-skipped tags"`;
+      const out = await remote(`B=$(mktemp) && cat > "$B" && ${exec.host.join(' && ')} && { ${others}; }; rc=$?; rm -f "$B"; exit $rc`, readFileSync(b), 'updating the destination checkout');
+      for (const m of out.matchAll(/^sshrm-(updated|skipped) (.+)$/gm)) branches[m[1] as 'updated' | 'skipped'].push(m[2]);
     }
     if (exec.copy.length) {
       // Executable bits come from the index (Windows has none); a copied 755 script must not turn 644 on the host.
@@ -1120,11 +1241,14 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
     }
     if (exec.remove.length) await remote(`cd ${r} && xargs -0 rm -f --`, list(exec.remove), 'removing deleted files');
     const v = await verifyProjectSync(ctx, { project_id: input.project_id, destination_location_id: dest.id, expected_source_snapshot: pre.source_snapshot!,
-      operation_id: op, expected_generations: pre.generations, transfer_mode: 'gui_sync' });
-    return { outcome: v.outcome, verdict: (v as { verdict?: string }).verdict ?? null, commit: pre.summary.source.head, files_copied: exec.copy.length,
-      note: v.outcome === 'verified' ? `Synced${pre.summary.source.head ? ` to ${pre.summary.source.head}` : ''} and verified.` : `Sync ran but verify says ${v.outcome}: ${'reason' in v ? v.reason : 'run Preflight'}` };
+      operation_id: op, expected_generations: pre.generations, transfer_mode: `${owner}_sync` });
+    const kept = backup ? ` ${backup.stashed} host file(s) were kept in git stash "${backup.message}" on the host (git stash list).` : '';
+    const other = (branches.updated.length ? ` Also updated ${branches.updated.length} other branch(es): ${branches.updated.slice(0, 10).join(', ')}.` : '') +
+      (branches.skipped.length ? ` Left alone (${branches.skipped.join(', ').slice(0, 300)}): the host has its own commits there or has it checked out.` : '');
+    return { outcome: v.outcome, verdict: (v as { verdict?: string }).verdict ?? null, commit: pre.summary.source.head, files_copied: exec.copy.length, backup, branches,
+      note: (v.outcome === 'verified' ? `Synced${pre.summary.source.head ? ` to ${pre.summary.source.head}` : ''} and verified.` : `Sync ran but verify says ${v.outcome}: ${'reason' in v ? v.reason : 'run Preflight'}`) + other + kept };
   } finally {
-    releaseLease(ctx, { location_id: dest.id, operation_id: op, owner: 'gui' });
+    releaseLease(ctx, { location_id: dest.id, operation_id: op, owner });
     rmSync(tmp, { recursive: true, force: true });
   }
 }
@@ -1187,14 +1311,21 @@ export function releaseLease(ctx: Ctx, raw: unknown) {
   return { released: Number(r.changes) > 0 };
 }
 
+/** Only uncommitted host work blocks, so "back up and sync" can stash it on the host (recoverable there) and go on. */
+const BACKUP_OK = new Set(['destination_dirty', 'revision_mismatch', 'branch_mismatch', 'content_mismatch']);
+function canBackUp(facts: Fact[], diff: ReturnType<typeof compare>['diff'], dst: Inspection) {
+  return !!dst.git?.is_repo && diff.dest_uncommitted.length > 0 && !diff.dest_committed.length && facts.every((f) => !f.blocking || BACKUP_OK.has(f.kind));
+}
+
 /** GUI Changes list: every path that differs, with whether the destination's own work is on it. Not sent to agents. */
 function fileList(diff: ReturnType<typeof compare>['diff']) {
   const dirty = new Set(diff.dest_uncommitted);
   const ahead = new Set(diff.dest_committed);
-  const both = new Set(diff.since_verified_sync?.both ?? []);
-  const row = (status: 'modified' | 'added' | 'host_only') => (path: string) =>
-    ({ path, status, host_dirty: dirty.has(path), host_committed: ahead.has(path), conflict: both.has(path) });
-  return [...diff.changed.map(row('modified')), ...diff.missing.map(row('added')), ...[...diff.extra_owned, ...diff.extra_unknown].map(row('host_only'))]
+  const risk = new Set([...diff.dest_uncommitted, ...diff.dest_committed]);
+  const both = new Set((diff.since_verified_sync?.both ?? []).filter((p) => risk.has(p)));
+  const row = (status: 'modified' | 'added' | 'host_only' | 'kept') => (path: string) =>
+    ({ path, status, host_dirty: dirty.has(path), host_committed: ahead.has(path), conflict: both.has(path), host_kept: status === 'kept' });
+  return [...diff.kept.map(row('kept')), ...diff.changed.map(row('modified')), ...diff.missing.map(row('added')), ...[...diff.extra_owned, ...diff.extra_unknown].map(row('host_only'))]
     .sort((a, b) => a.path.localeCompare(b.path));
 }
 
@@ -1244,4 +1375,32 @@ export async function diffProjectFile(ctx: Ctx, raw: unknown) {
     const body = r.stdout.slice(r.stdout.indexOf('\n@@') + 1);
     return { ...out, diff: r.stdout.includes('\n@@') ? body : '' };
   } finally { rmSync(tmp, { recursive: true, force: true }); }
+}
+
+/**
+ * Read or edit the project's `.sshrmignore` (in its source folder on this PC). Ignored paths are left out of compare and
+ * sync on both sides: they never block, copy or show. Only edits the listed lines; comments and order stay.
+ */
+export function editProjectIgnore(ctx: Ctx, raw: unknown) {
+  const line = z.string().trim().min(1).max(200).refine((s) => !/[\r\n\0]/.test(s), 'one pattern per entry');
+  const input = z.object({ project_id: z.uuid(), location_id: z.uuid().optional(), add: z.array(line).max(100).default([]), remove: z.array(line).max(100).default([]) }).strict().parse(raw);
+  const project = getProjectRow(ctx.db, input.project_id);
+  const id = input.location_id ?? project.source_location_id;
+  const l = id ? getLocationRow(ctx.db, id) : null;
+  if (!l || l.project_id !== project.id) throw new AppError('VALIDATION_ERROR', 'location_id must be a location of this project (default: its source)');
+  const dir = sourceDirOf(ctx.db, l);
+  if (!dir || !existsSync(dir)) throw new AppError('VALIDATION_ERROR', 'the source folder of this setup is not on this PC; .sshrmignore lives there');
+  const before = readIgnore(dir);
+  const lines = before ? before.replace(/\r?\n$/, '').split(/\r?\n/) : ['# SSH Resource Manager: paths left out of compare and sync (gitignore-style; ! is not supported)'];
+  const drop = new Set(input.remove);
+  const out = lines.filter((x) => !drop.has(x.trim()));
+  const added = input.add.filter((a, i) => !out.some((x) => x.trim() === a) && input.add.indexOf(a) === i);
+  out.push(...added);
+  const removed = lines.length - (out.length - added.length);
+  if (added.length || removed) {
+    writeFileSync(join(dir, IGNORE_FILE), out.join(before.includes('\r\n') ? '\r\n' : '\n') + '\n');
+    audit(ctx.db, ctx.source, 'project.ignore', null, null, null, { project_id: project.id, added, removed: input.remove });
+  }
+  return { file: join(dir, IGNORE_FILE), patterns: out.map((x) => x.trim()).filter((x) => x && !x.startsWith('#')), added, removed,
+    note: added.length || removed ? 'Takes effect on the next preflight; previous verification of this setup no longer applies to the changed paths.' : 'No change.' };
 }

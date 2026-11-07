@@ -30,7 +30,7 @@ function ensureApp() {
 }
 ensureApp();
 const server = new McpServer({ name: 'ssh-resource-manager', version: '1.0.0' }, {
-  instructions: 'Registry of SSH hosts and project locations on this PC. It does NOT execute arbitrary commands: get a recipe with ssh_hosts_get_connection_recipe and run OpenSSH from your own terminal. Before build/run/test on a remote location, call ssh_projects_preflight; after transferring files call ssh_projects_verify_sync. Never send passwords or private keys.',
+  instructions: 'Registry of SSH hosts and project locations on this PC. It does NOT execute arbitrary commands: get a recipe with ssh_hosts_get_connection_recipe and run OpenSSH from your own terminal. Before build/run/test on a remote location, call ssh_projects_preflight. To bring a Git project there, call ssh_projects_sync (one call: commits, uncommitted files, line endings, verify; fast-forward only, never overwrites host work); only if it is not offered, follow the plan by hand and then call ssh_projects_verify_sync. Never send passwords or private keys.',
 });
 
 type Ann = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
@@ -154,6 +154,14 @@ tool('ssh_projects_preflight', 'REQUIRED before build/run/test on a destination:
 tool('ssh_projects_verify_sync', 'After YOU transferred files, have the manager re-read both sides and verify the destination matches expected_source_snapshot. Your own claim of success is not evidence.',
   z.object({ project_id: uuid, destination_location_id: uuid, expected_source_snapshot: z.string(), operation_id: z.string(), expected_generations: z.object({ source: int, destination: int }), transfer_mode: z.string().optional() }),
   { readOnlyHint: false, destructiveHint: false, openWorldHint: true }, (i) => core.verifyProjectSync(i));
+
+tool('ssh_projects_ignore', 'Read or edit the project\'s .sshrmignore (in its source folder on this PC): gitignore-style patterns for paths this manager leaves out of compare and sync on BOTH sides, so they never block ready, get copied or listed (e.g. "build/", "*.log", "quran_coach/assets/tmp/"). ' +
+  'Call with no add/remove to read it. Add only paths the user agreed are not part of the project\'s synced content (build output, caches, local-only files); never to hide host work you were told to preserve. ".env"-style secrets are always excluded already.',
+  z.object({ project_id: uuid, location_id: uuid.optional(), add: z.array(z.string()).max(100).optional(), remove: z.array(z.string()).max(100).optional() }), WRITE, (i) => core.editProjectIgnore(i));
+
+tool('ssh_projects_sync', 'Bring a Git project on this PC to its remote host in ONE call, then verify: the manager bundles the current branch (plus all other branches and tags, fast-forward only), clones/switches/fast-forwards the host checkout, copies your uncommitted files (Windows line endings fixed), mirrors uncommitted deletions, and runs verify_sync. ' +
+  'No preflight needed first: it runs its own and, when the plan is not one it can run, refuses with the verdict and blocking facts and changes nothing. Do not fetch recipes, bundle, scp or verify yourself. It also refuses when the host has its own commits or uncommitted work that the sync would overwrite: then show the user the preflight facts. Returns outcome (verified | partial | ...), commit, files_copied and branches {updated, skipped}.',
+  z.object({ project_id: uuid, destination_location_id: uuid }), { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }, (i) => core.syncProject(i));
 
 tool('ssh_projects_acquire_lease', 'Acquire/renew a short coordination lease on a destination before transferring. Not a filesystem lock.',
   z.object({ location_id: uuid, operation_id: z.string(), owner: z.string(), ttl_seconds: z.number().int().min(10).max(900).optional() }), WRITE, (i) => core.acquireLease(i));

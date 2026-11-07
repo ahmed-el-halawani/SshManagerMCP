@@ -610,6 +610,7 @@ pre {
 .gd-mark { width: 14px; height: 14px; flex-shrink: 0; border: 1px solid currentColor; border-radius: 3px; font-size: 10px; line-height: 12px; text-align: center; color: var(--bad); }
 .gd-mark.M { color: var(--warn); }
 .gd-mark.A { color: var(--ok); }
+.gd-mark.K { color: var(--blue, #58a6ff); }
 .gd-commit { border-top: 1px solid var(--chrome-line); padding: 10px; display: flex; flex-direction: column; gap: 8px; }
 .gd-commit-sum { padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--chrome); font-size: 12.5px; }
 .gd-commit-desc { min-height: 54px; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--chrome); font-size: 12px; color: var(--fg-dim); }
@@ -666,6 +667,9 @@ body.resizing { cursor: col-resize; user-select: none; }
 .gd-seg button.on { background: var(--panel-active); color: var(--fg); }
 .gd-seg-n { color: var(--muted); font-size: 11px; }
 .gd-list-empty { padding: 14px 12px; color: var(--muted); font-size: 12.5px; }
+.gd-list-hint { padding: 0 12px 8px; color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+.gd-list-hint.link { display: block; width: 100%; text-align: left; background: none; border: 0; cursor: pointer; font: inherit; font-size: 11.5px; }
+.gd-list-hint.link:hover { color: var(--text, inherit); text-decoration: underline; }
 
 /* clickable file rows */
 button.gd-file { width: 100%; border: none; border-bottom: 1px solid rgba(0,0,0,.15); border-radius: 0; background: none; text-align: left; font-weight: 400; color: var(--fg); }
@@ -698,3 +702,4 @@ button.gd-file.sel .gd-mark:not(.dirty) { color: #fff; }
 .gd-diff-table tr.del { background: rgba(248, 81, 73, 0.15); }
 .gd-diff-table tr.del .ln { background: rgba(248, 81, 73, 0.25); }
 .gd-diff-table tr.hunk td { background: rgba(56, 139, 253, 0.12); color: var(--muted); padding: 3px 8px; }
+.gd-ignore { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; }

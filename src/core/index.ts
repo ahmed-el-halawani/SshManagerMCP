@@ -83,6 +83,7 @@ export function createCore(opts: { dataDir?: string; source: Source }) {
     preflightProject: (i: unknown) => projects.preflightProject(ctx, i),
     verifyProjectSync: (i: unknown) => projects.verifyProjectSync(ctx, i),
     syncProject: (i: unknown) => projects.syncProject(ctx, i),
+    editProjectIgnore: (i: unknown) => projects.editProjectIgnore(ctx, i),
     diffProjectFile: (i: unknown) => projects.diffProjectFile(ctx, i),
     // GUI History tab: past verifications of one destination, with the source commit they were checked against.
     syncHistory: (i: { destination_location_id: string; limit?: number }) => ({

@@ -417,7 +417,10 @@ test('Sync now (GUI): uncommitted files, then fast-forward with new commits, ver
   const { core, project, loc, pre } = setup(src, dst);
   writeFileSync(join(src, 'a.txt'), 'wip\n');
   writeFileSync(join(src, 'src', 'new.txt'), 'untracked\n');
-  assert.equal(((await pre()).suggested_plan as { exec?: unknown }).exec, undefined, 'agents never see exec');
+  const p0 = await pre() as Pre & { suggested_plan: { exec?: unknown; one_call?: string }; summary: { next_step: string } };
+  assert.equal(p0.suggested_plan.exec, undefined, 'agents never see exec');
+  assert.equal(p0.suggested_plan.one_call, 'ssh_projects_sync', 'agents are told the plan runs in one call');
+  assert.match(p0.summary.next_step, /ssh_projects_sync/);
   let r = await syncNow(core, project, loc);
   assert.equal(r.outcome, 'verified');
   assert.equal(r.files_copied, 2);
@@ -433,7 +436,7 @@ test('Sync now (GUI): uncommitted files, then fast-forward with new commits, ver
   const hist = core.syncHistory({ destination_location_id: loc.id }).syncs as { outcome: string; transfer_mode: string; head: string; evidence: { verdict: string } }[];
   assert.deepEqual(hist.map((h) => h.outcome), ['verified', 'verified'], 'History tab lists both syncs, newest first');
   assert.equal(hist[0].head, git(src, 'rev-parse', 'HEAD'), 'with the source commit they were verified against');
-  assert.equal(hist[0].transfer_mode, 'gui_sync');
+  assert.equal(hist[0].transfer_mode, 'agent_sync', 'this core is the MCP side: ssh_projects_sync');
   core.acquireLease({ location_id: loc.id, operation_id: 'next', owner: 'agent' }); // the GUI lease was released
 });
 
@@ -445,7 +448,8 @@ test('Sync now refuses when the destination has its own commits, and changes not
   git(dst, 'commit', '-qam', 'mac-only commit');
   const head = git(dst, 'rev-parse', 'HEAD');
   git(src, 'commit', '-q', '--allow-empty', '-m', 'pc commit');
-  await assert.rejects(syncNow(core, project, loc), (e: { message: string }) => /nothing Sync now can do safely|Not possible to fast-forward/.test(e.message));
+  await assert.rejects(syncNow(core, project, loc), (e: { message: string; details?: { verdict: string; blocking: { kind: string }[] } }) =>
+    e.details?.verdict === 'destination_ahead' && (/refused by git, nothing was overwritten/.test(e.message) || e.details.blocking.some((f) => f.kind === 'destination_ahead')));
   assert.equal(git(dst, 'rev-parse', 'HEAD'), head);
   assert.equal(readFileSync(join(dst, 'a.txt'), 'utf8'), 'mac only\n');
 });
@@ -487,6 +491,70 @@ test('Sync now at scale: 120 new files, Unicode names, uncommitted delete/rename
   assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
 });
 
+test('host files holding content the PC repo already has are not host work; real host edits can be backed up to a stash, then synced', async () => {
+  const src = tempRepo({ 'a.txt': 'v1\n', 'c.txt': 'c1\n', 'mine.txt': 'base\n' });
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst, makeCore('gui'));
+  writeFileSync(join(src, 'base.txt'), 'base\n');
+  await syncNow(core, project, loc); // verified baseline
+  writeFileSync(join(src, 'a.txt'), 'v2\n');
+  git(src, 'commit', '-qam', 'v2');
+  writeFileSync(join(src, 'a.txt'), 'v3\n');
+  writeFileSync(join(src, 'mine.txt'), 'pc v3\n'); // the PC changed it too, so the host edit is in the way
+  git(src, 'commit', '-qam', 'v3');
+  // like the real Mac: an old source version sits in the host's working tree (reset back to an older HEAD), plus one real edit
+  writeFileSync(join(dst, 'a.txt'), 'v2\n');
+  writeFileSync(join(dst, 'mine.txt'), 'edited on the host\n');
+  type Pre = { verdict: string; can_back_up: boolean; files: { path: string; host_dirty: boolean }[] };
+  const r = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, intent: 'transfer' }) as Pre;
+  const by = Object.fromEntries(r.files.map((f) => [f.path, f]));
+  assert.equal(by['a.txt'].host_dirty, false, 'v2 is in the PC history: replacing it loses nothing');
+  assert.equal(by['mine.txt'].host_dirty, true, 'the PC never had this content');
+  assert.equal(r.verdict, 'destination_dirty');
+  assert.equal(r.can_back_up, true);
+  await assert.rejects(syncNow(core, project, loc), /nothing Sync now can do safely/);
+  assert.equal(readFileSync(join(dst, 'mine.txt'), 'utf8'), 'edited on the host\n', 'plain Sync never touches host work');
+  const s = await core.syncProject({ project_id: project.id, destination_location_id: loc.id, backup_host_changes: true }) as Sync & { backup: { stashed: number } };
+  assert.equal(s.outcome, 'verified');
+  assert.equal(s.backup.stashed, 1);
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.match(git(dst, 'stash', 'list'), /SSH Resource Manager backup before sync/);
+  assert.equal(git(dst, 'stash', 'show', '--name-only'), 'mine.txt', 'only the host edit was stashed');
+});
+
+test('host edits the sync never touches are kept as they are: no backup needed, verified, still there afterwards', async () => {
+  const src = tempRepo({ 'a.txt': 'v1\n', 'Podfile.lock': 'pods v1\n', 'pubspec.lock': 'pub v1\n' });
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst, makeCore('gui'));
+  writeFileSync(join(src, 'base.txt'), 'base\n');
+  await syncNow(core, project, loc);
+  writeFileSync(join(src, 'a.txt'), 'v2\n');
+  writeFileSync(join(src, 'pubspec.lock'), 'pub v2\n');
+  git(src, 'commit', '-qam', 'v2');
+  writeFileSync(join(dst, 'Podfile.lock'), 'pods from a Mac build\n'); // the PC never changed this file: no conflict
+  writeFileSync(join(dst, 'build.log'), 'host only, untracked\n');
+  writeFileSync(join(dst, 'pubspec.lock'), 'pub from a Mac build\n'); // the PC changed it too: a real conflict
+  type Pre = { can_back_up: boolean; files: { path: string; status: string; host_dirty: boolean }[] };
+  const r = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, intent: 'transfer' }) as Pre;
+  const by = Object.fromEntries(r.files.map((f) => [f.path, f]));
+  assert.equal(by['Podfile.lock'].status, 'kept');
+  assert.equal(by['build.log'].status, 'kept');
+  assert.equal(by['pubspec.lock'].host_dirty, true);
+  assert.equal(r.can_back_up, true);
+  const s = await core.syncProject({ project_id: project.id, destination_location_id: loc.id, backup_host_changes: true }) as Sync & { backup: { stashed: number } };
+  assert.equal(s.outcome, 'verified');
+  assert.equal(s.backup.stashed, 1, 'only the conflicting file is stashed');
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.equal(readFileSync(join(dst, 'Podfile.lock'), 'utf8'), 'pods from a Mac build\n');
+  assert.equal(readFileSync(join(dst, 'build.log'), 'utf8'), 'host only, untracked\n');
+  assert.equal(readFileSync(join(dst, 'pubspec.lock'), 'utf8').replaceAll('\r', ''), 'pub v2\n');
+  // nothing in the way at all: a plain sync runs with the host edit in place
+  writeFileSync(join(src, 'a.txt'), 'v3\n');
+  git(src, 'commit', '-qam', 'v3');
+  assert.equal((await syncNow(core, project, loc)).outcome, 'verified');
+  assert.equal(readFileSync(join(dst, 'Podfile.lock'), 'utf8'), 'pods from a Mac build\n');
+});
+
 test('GUI file list marks host-dirty files; file preview diffs PC vs host and never reads credentials', async () => {
   const src = tempRepo();
   const dst = cloneTo(src);
@@ -501,11 +569,89 @@ test('GUI file list marks host-dirty files; file preview diffs PC vs host and ne
   const by = Object.fromEntries(r.files.map((f) => [f.path, f]));
   assert.equal(by['a.txt'].host_dirty, false, 'changed only on the PC: not dirty');
   assert.equal(by['b.txt'].host_dirty, true, 'changed on the host too: dirty');
-  assert.equal(by['src/new.txt'].status, 'host_only');
+  assert.equal(by['src/new.txt'].status, 'kept', 'a host-only file the sync never touches stays');
   const d = await core.diffProjectFile({ project_id: project.id, destination_location_id: loc.id, path: 'b.txt' }) as { diff: string };
   assert.match(d.diff, /^-host$/m);
   assert.match(d.diff, /^\+pc$/m);
   for (const bad of ['.env', '../x', '/etc/passwd', 'a/../../x']) await assert.rejects(core.diffProjectFile({ project_id: project.id, destination_location_id: loc.id, path: bad }));
   assert.equal((await core.preflightProject({ project_id: project.id, destination_location_id: loc.id }) as { files?: unknown }).files === undefined, false, 'gui core includes files');
   assert.equal((await setup(src, dst).pre() as { files?: unknown }).files, undefined, 'agents never get the file list');
+});
+
+test('a host-only leftover of a file the PC deleted in a commit is kept (GUI), not a blocker or a "From this PC" change', async () => {
+  const src = tempRepo({ 'a.txt': 'v1\n', 'assets/old.mp3': 'old voice\n' });
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst, makeCore('gui'));
+  git(src, 'rm', '-q', 'assets/old.mp3');
+  git(src, 'commit', '-qm', 'drop old voice');
+  assert.equal((await syncNow(core, project, loc)).outcome, 'verified');
+  mkdirSync(join(dst, 'assets'), { recursive: true });
+  writeFileSync(join(dst, 'assets', 'old.mp3'), 'old voice\n'); // put back on the host, untracked: content the PC repo knows
+  type Pre = { verdict: string; files: { path: string; status: string }[] };
+  const r = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, intent: 'transfer' }) as Pre;
+  assert.equal(r.verdict, 'ready');
+  assert.deepEqual(r.files.map((f) => [f.path, f.status]), [['assets/old.mp3', 'kept']]);
+});
+
+test('.sshrmignore: gitignore-style lines; ignored paths drop out of compare on both sides, for agents too', async () => {
+  const { ignoreGlobs } = await import('../src/core/projects.ts');
+  assert.deepEqual(ignoreGlobs('# c\n\n*.log\nbuild/\n/top.txt\na/b\n!keep\n'), ['**/*.log', '**/*.log/**', '**/build/**', 'top.txt', 'top.txt/**', 'a/b', 'a/b/**']);
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  const { core, project, pre } = setup(src, dst);
+  writeFileSync(join(dst, 'host.log'), 'host only\n');
+  mkdirSync(join(dst, 'cache'));
+  writeFileSync(join(dst, 'cache', 'x.bin'), 'x\n');
+  assert.equal((await pre()).verdict, 'destination_dirty');
+  const e = core.editProjectIgnore({ project_id: project.id, add: ['*.log', 'cache/', '*.log'] }) as { added: string[]; patterns: string[] };
+  assert.deepEqual(e.added, ['*.log', 'cache/']);
+  assert.deepEqual((core.editProjectIgnore({ project_id: project.id }) as { patterns: string[] }).patterns, ['*.log', 'cache/'], 'no add/remove = read');
+  assert.equal((await pre()).verdict, 'content_mismatch', 'the new .sshrmignore itself is an uncommitted source file to copy');
+  git(src, 'add', '.sshrmignore');
+  git(src, 'commit', '-qm', 'ignore');
+  git(dst, 'pull', '-q', src, 'HEAD');
+  assert.equal((await pre()).verdict, 'ready');
+  core.editProjectIgnore({ project_id: project.id, remove: ['cache/'] });
+  assert.match(readFileSync(join(src, '.sshrmignore'), 'utf8'), /^\*\.log$/m);
+});
+
+test('Sync now carries every branch and tag; a host branch with its own commits is left alone', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst, makeCore('gui'));
+  const main = git(src, 'rev-parse', '--abbrev-ref', 'HEAD');
+  git(src, 'switch', '-qc', 'feature');
+  git(src, 'commit', '-q', '--allow-empty', '-m', 'feature work');
+  git(src, 'switch', '-qc', 'mine');
+  git(src, 'commit', '-q', '--allow-empty', '-m', 'pc side');
+  git(src, 'switch', '-q', main);
+  git(src, 'commit', '-q', '--allow-empty', '-m', 'main moves');
+  git(src, 'tag', 'v1');
+  git(dst, 'branch', 'mine', git(dst, 'rev-parse', 'HEAD'));
+  git(dst, 'switch', '-q', 'mine');
+  git(dst, 'commit', '-q', '--allow-empty', '-m', 'host side');
+  const hostMine = git(dst, 'rev-parse', 'HEAD');
+  git(dst, 'switch', '-q', main);
+  const r = await syncNow(core, project, loc) as Sync & { branches: { updated: string[]; skipped: string[] } };
+  assert.equal(r.outcome, 'verified');
+  assert.deepEqual(r.branches, { updated: ['feature'], skipped: ['mine'] });
+  assert.equal(git(dst, 'rev-parse', 'feature'), git(src, 'rev-parse', 'feature'));
+  assert.equal(git(dst, 'rev-parse', 'mine'), hostMine, 'diverged host branch untouched');
+  assert.equal(git(dst, 'rev-parse', 'v1'), git(src, 'rev-parse', 'v1'));
+});
+
+test('agent copies an uncommitted file with Windows line endings: not host work; the plan says how to fix it, then verify passes', async () => {
+  const src = tempRepo({ 'README.md': 'hello\n', 'src/a.txt': 'a\n' });
+  const dst = cloneTo(src);
+  git(dst, 'config', 'core.autocrlf', 'false'); // a Mac: no line-ending conversion
+  git(src, 'config', 'core.autocrlf', 'true'); // a Windows checkout: CRLF in the working tree, LF in Git
+  writeFileSync(join(src, 'README.md'), 'hello\r\nSearch: search(text) returns matching note ids.\r\n');
+  const { core, project, loc, pre } = setup(src, dst);
+  copyFileSync(join(src, 'README.md'), join(dst, 'README.md')); // what an agent does with scp: raw bytes, CRLF included
+  const r = await pre() as Pre & { suggested_plan: { steps: string[] } };
+  assert.equal(r.verdict, 'content_mismatch', 'the PC\'s own bytes on the host are not "destination work"');
+  assert.ok(r.suggested_plan.steps.some((s) => s.includes('perl -pi -e') && s.includes('README.md')), 'the plan carries the line-ending fix');
+  writeFileSync(join(dst, 'README.md'), readFileSync(join(dst, 'README.md'), 'utf8').replaceAll('\r\n', '\n')); // the perl step
+  const v = await core.verifyProjectSync({ project_id: project.id, destination_location_id: loc.id, expected_source_snapshot: r.source_snapshot, operation_id: 'agent-1', expected_generations: r.generations }) as Verify;
+  assert.equal(v.outcome, 'verified');
 });
