@@ -13,9 +13,10 @@ AI agent terminal ── OpenSSH ── remote host (unrestricted, your account'
 - **Installer:** run `npm run dist` to build `dist-installer/SSH Resource Manager Setup *.exe` (NSIS, per-user). No global Node is needed: the app's own executable also runs the MCP server (`ELECTRON_RUN_AS_NODE=1`).
 - **Dev:** run `npm install`, then `npm run start` (GUI) and `npm run mcp` (MCP on system Node 24+).
 - **Requirements:** the Windows OpenSSH Client (`ssh`, `scp`, `ssh-keyscan`, `ssh-keygen`) and Git for local project inspection. Remote hosts need `sh`, plus `git` and `sha256sum`/`shasum` for project checks.
+- **Right-click:** changed files, the diff, history, the project/destination pickers, hosts, host details, mappings, the remote folder picker and the Setup agent cards all have a context menu (or a ⋯ button): Open / Open with… / Show in Explorer / VS Code, copy paths and hashes, ignore files, sync, remove. Text boxes get Cut / Copy / Paste.
 
 ## Connect your AI client
-Open **Setup**, copy the generated JSON into your client's MCP config, and restart the client. The app never edits client configs. The JSON looks like this:
+Open **Setup → Connect AI agents** and press **Add** (or **Add to all agents found**) for Claude Desktop, Claude Code, Codex, Gemini CLI, Antigravity, Cursor, VS Code or Windsurf, then restart that agent. Only the `ssh-resource-manager` entry is written; the rest of the file stays and the previous file is kept as `*.sshrm.bak`. **Update** repoints an entry that still runs another copy of the app. For any other client, copy the JSON from the same section; it looks like this:
 ```json
 { "mcpServers": { "ssh-resource-manager": {
   "command": "C:\\Users\\you\\AppData\\Local\\Programs\\ssh-resource-manager\\SSH Resource Manager.exe",

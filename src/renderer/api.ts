@@ -1,3 +1,4 @@
+export type AgentStatus = { id: string; name: string; file: string; detected: boolean; state: 'missing' | 'current' | 'other_build' | 'unreadable'; restart: string; error?: string };
 type Envelope<T> = { ok: true; result: T } | { ok: false; error: ApiError };
 export type ApiError = { code: string; message: string; next_action?: string; current_revision?: number; issues?: { path: string; message: string }[]; [k: string]: unknown };
 
@@ -10,12 +11,20 @@ declare global {
       setLoginItem: (enabled: boolean) => Promise<{ supported: boolean; enabled: boolean }>;
       importP12: (hostId: string, password: string) => Promise<Envelope<unknown> | null>;
       mcpConfig: () => Promise<unknown>;
+      mcpAgents: () => Promise<AgentStatus[]>;
+      mcpAgentSet: (id: string, add: boolean) => Promise<Envelope<AgentStatus>>;
       exportData: () => Promise<string | null>;
       importPreview: () => Promise<Envelope<unknown> | null>;
       importApply: () => Promise<Envelope<unknown>>;
       backup: () => Promise<string | null>;
       openDataDir: () => Promise<string>;
       copyText: (text: string) => Promise<boolean>;
+      revealFile: (path: string) => Promise<boolean>;
+      openFile: (path: string) => Promise<string | true>;
+      openWith: (path: string) => Promise<boolean>;
+      openIgnoreFile: (dir: string) => Promise<string | true>;
+      restoreAgentBackup: (id: string) => Promise<Envelope<AgentStatus>>;
+      agentBackupExists: (id: string) => Promise<boolean>;
       showFolder: (path: string) => Promise<string>;
       openInVscode: (path: string, sshAlias?: string) => Promise<boolean>;
     };

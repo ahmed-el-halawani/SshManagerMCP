@@ -1,8 +1,10 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCore, createLogger, errorPayload } from '../core/index.ts';
+import { agents, agentStatus, setAgentEntry, SERVER, type McpEntry } from '../core/agents.ts';
 
 // One app per user. A second launch (agent self-open, login item, double-click) only wakes the first one.
 // --background = start in the tray without a window (login item, MCP self-open).
@@ -44,11 +46,19 @@ ipcMain.handle('import-p12', async (_e, hostId: string, password: string) => {
   } catch (e) { return { ok: false, error: errorPayload(e) }; }
 });
 
-ipcMain.handle('mcp-config', () => {
-  // Same executable runs the MCP server as plain Node: one runtime, no global Node needed.
-  // Data dir is pinned explicitly so a client can never silently open a different DB.
-  const entry = join(here, '..', 'mcp', 'server.js');
-  return { mcpServers: { 'ssh-resource-manager': { command: process.execPath, args: [entry, `--data-dir=${core.dataDir}`], env: { ELECTRON_RUN_AS_NODE: '1' } } } };
+// Same executable runs the MCP server as plain Node: one runtime, no global Node needed.
+// Data dir is pinned explicitly so a client can never silently open a different DB.
+const mcpEntry = (): McpEntry => ({ command: process.execPath, args: [join(here, '..', 'mcp', 'server.js'), `--data-dir=${core.dataDir}`], env: { ELECTRON_RUN_AS_NODE: '1' } });
+ipcMain.handle('mcp-config', () => ({ mcpServers: { [SERVER]: mcpEntry() } }));
+
+// "Add to AI agent": the renderer only names an agent id; paths and the entry are decided here.
+const agentList = () => agents(app.getPath('home'), app.getPath('appData'));
+ipcMain.handle('mcp-agents', () => agentList().map((a) => agentStatus(a, mcpEntry())));
+ipcMain.handle('mcp-agent-set', (_e, id: string, add: boolean) => {
+  const a = agentList().find((x) => x.id === id);
+  if (!a) return { ok: false, error: { code: 'VALIDATION_ERROR', message: `unknown agent ${id}` } };
+  try { setAgentEntry(a, add ? mcpEntry() : null); log('info', 'mcp-agent-set', { id, add }); return { ok: true, result: agentStatus(a, mcpEntry()) }; }
+  catch (e) { return { ok: false, error: { code: 'CONFIG_WRITE_FAILED', message: (e as Error).message } }; }
 });
 
 ipcMain.handle('export', async () => {
@@ -85,6 +95,33 @@ ipcMain.handle('open-in-vscode', (_e, path: string, sshAlias?: string) => {
   if (sshAlias && !/^[\w.-]+$/.test(sshAlias)) return false;
   return shell.openExternal(sshAlias ? `vscode://vscode-remote/ssh-remote+${sshAlias}${p.startsWith('/') ? '' : '/'}${encodeURI(p)}` : `vscode://file/${encodeURI(p)}`).then(() => true, () => false);
 });
+
+// Right-click menus: file actions on a local path only (no commands, no arguments beyond the path).
+const localFile = (p: unknown) => { const s = String(p ?? ''); return isAbsolute(s) && existsSync(s) ? s : null; };
+ipcMain.handle('reveal-file', (_e, p: string) => { const f = localFile(p); if (f) shell.showItemInFolder(f); return !!f; });
+ipcMain.handle('open-file', async (_e, p: string) => { const f = localFile(p); return f ? (await shell.openPath(f)) || true : 'missing'; });
+ipcMain.handle('open-with', (_e, p: string) => {
+  const f = localFile(p);
+  if (!f || process.platform !== 'win32') return false;
+  spawn(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'rundll32.exe'), ['shell32.dll,OpenAs_RunDLL', f], { detached: true, stdio: 'ignore' }).unref();
+  return true;
+});
+// .sshrmignore of a project folder: created empty on first use so "Edit" always opens something.
+ipcMain.handle('open-ignore-file', async (_e, dir: string) => {
+  const d = localFile(dir);
+  if (!d || !statSync(d).isDirectory()) return 'missing';
+  const f = join(d, '.sshrmignore');
+  if (!existsSync(f)) writeFileSync(f, '# Paths SSH Resource Manager leaves out of sync and checks (gitignore style)\n');
+  return (await shell.openPath(f)) || true;
+});
+ipcMain.handle('restore-agent-backup', (_e, id: string) => {
+  const a = agentList().find((x) => x.id === id);
+  if (!a || !existsSync(`${a.file}.sshrm.bak`)) return { ok: false, error: { code: 'NOT_FOUND', message: 'No backup to restore.' } };
+  copyFileSync(`${a.file}.sshrm.bak`, a.file);
+  log('info', 'restore-agent-backup', { id });
+  return { ok: true, result: agentStatus(a, mcpEntry()) };
+});
+ipcMain.handle('agent-backup-exists', (_e, id: string) => { const a = agentList().find((x) => x.id === id); return !!a && existsSync(`${a.file}.sshrm.bak`); });
 
 ipcMain.handle('copy-text', (_e, text: string) => {
   clipboard.writeText(String(text ?? ''));
@@ -124,6 +161,14 @@ function createWindow() {
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.removeMenu();
+  // Electron has no built-in right-click menu: text boxes get Cut/Copy/Paste, selected text gets Copy.
+  // The page's own menus call preventDefault, so this only shows where the page has none.
+  win.webContents.on('context-menu', (_e, p) => {
+    const items: Electron.MenuItemConstructorOptions[] = p.isEditable
+      ? [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { type: 'separator' }, { role: 'selectAll' }]
+      : p.selectionText.trim() ? [{ role: 'copy' }, { role: 'selectAll' }] : [];
+    if (items.length) Menu.buildFromTemplate(items).popup({ window: win! });
+  });
   win.loadFile(join(here, '..', 'renderer', 'index.html'));
   win.once('ready-to-show', () => win?.show());
   // Closing the window keeps the app in the tray; only "Quit" in the tray menu exits.

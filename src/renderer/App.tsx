@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { age, call, CallError, checkHost, copy, errText, idem } from './api.ts';
+import { age, call, CallError, checkHost, copy, errText, idem, type AgentStatus } from './api.ts';
+import { copyItem, hostPath, localFileItems, localPath, useMenu, type MenuItem } from './menu.tsx';
 
 type Status = { state: string; checked_at: string | null; stale: boolean; error_code: string | null };
 type HostSummary = { id: string; name: string; enabled: boolean; target: string; active_address?: string; declared_os: string; observed_os: string | null; os_mismatch: boolean; tags: string[]; revision: number; status: Status; capability_keys: string[] };
@@ -42,6 +43,7 @@ export function App() {
   const hostCount = hostsData?.hosts.length ?? 0;
   const onlineCount = hostsData?.hosts.filter(h => h.status.state === 'reachable').length ?? 0;
   const go = (t: typeof tab) => { setTab(t); store.set('view', t); setHostId(null); setEditing(null); };
+  useEffect(() => { const f = () => go('projects'); window.addEventListener('sshrm-open-projects', f); return () => window.removeEventListener('sshrm-open-projects', f); }, []);
 
   return (
     <div className="app">
@@ -80,9 +82,9 @@ const store = {
 //   Changes / History → what Sync would send / past verified syncs · Commit to main → Sync to <host>
 // ═══════════════════════════════════════════════════════════
 
-function ToolbarItem({ icon, label, value, sub, open, onClick, disabled }: { icon: string; label: string; value: ReactNode; sub?: ReactNode; open?: boolean; onClick?: () => void; disabled?: boolean }) {
+function ToolbarItem({ icon, label, value, sub, open, onClick, disabled, onContextMenu }: { icon: string; label: string; value: ReactNode; sub?: ReactNode; open?: boolean; onClick?: () => void; disabled?: boolean; onContextMenu?: (e: React.MouseEvent) => void }) {
   return (
-    <button className={`gd-tb ${open ? 'open' : ''} ${onClick ? '' : 'static'}`} onClick={onClick} disabled={disabled} tabIndex={onClick ? 0 : -1}>
+    <button className={`gd-tb ${open ? 'open' : ''} ${onClick ? '' : 'static'}`} onClick={onClick} onContextMenu={onContextMenu} disabled={disabled} tabIndex={onClick ? 0 : -1}>
       <span className="gd-tb-icon">{icon}</span>
       <span className="gd-tb-text">{label && <span className="gd-tb-label">{label}</span>}<span className="gd-tb-value">{value}</span>{sub && <span className="gd-tb-label">{sub}</span>}</span>
       {open !== undefined && <span className="gd-tb-caret">{open ? '▴' : '▾'}</span>}
@@ -95,6 +97,31 @@ const OUTCOME: Record<string, { icon: string; cls: string; text: string }> = {
   partial: { icon: '◐', cls: 'warn', text: 'Partial' }, needs_recheck: { icon: '↻', cls: 'warn', text: 'Needs recheck' },
 };
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const ENV = navigator.userAgent.includes('Windows') ? 'windows-native' : 'posix-native';
+
+/** A folder or file on a host: VS Code Remote when the host has an ssh alias (key hosts), else copy an ssh command. */
+async function openOnHost(hostId: string, path: string | null | undefined): Promise<string> {
+  const h = await call('getHost', { host_id: hostId });
+  if (h.ssh_alias && path) { await window.api.openInVscode(path, h.ssh_alias); return `Opened ${path} in VS Code (Remote)`; }
+  await copy((await call('connectionRecipe', { host_id: hostId, caller_environment: ENV })).display);
+  return h.ssh_alias ? 'SSH command copied' : 'SSH command copied (VS Code Remote needs an SSH key login: Switch to SSH key on the host page)';
+}
+
+/** Removes one destination mapping (metadata only); the project goes too when it was its last host. */
+async function removeMapping(project: any, dest: any, hostName: string): Promise<boolean> {
+  const onlyHost = project.locations.filter((l: any) => l.role !== 'source').length === 1;
+  if (!confirm(`Remove the mapping of "${project.name}" to ${hostName}?\n\nMetadata only: no folder on either machine is touched.${onlyHost ? '\nThe project itself is removed too (it has no other hosts).' : ''}`)) return false;
+  await call('unbindProjectLocation', { location_id: dest.id, expected_revision: dest.revision });
+  if (onlyHost) { const p = await call('getProject', { project_id: project.id }); await call('removeProject', { project_id: project.id, expected_revision: p.revision }); }
+  return true;
+}
+
+/** Jump to the Projects view with this project and destination selected. */
+function openInProjects(projectId: string, destId: string) {
+  store.set('project', projectId); store.set('dest', destId); store.set('view', 'projects');
+  window.dispatchEvent(new Event('sshrm-open-projects'));
+}
+const sourceDir = (p: any) => { const l = p?.locations.find((x: any) => x.id === p.source_location_id); return l?.canonical_path ?? l?.path_input ?? null; };
 
 function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost: (id: string) => void }) {
   const { data, reload } = usePoll(() => call('listProjects', {}), [], 3000);
@@ -133,6 +160,12 @@ function ProjectsView({ hosts, onOpenHost }: { hosts: HostSummary[]; onOpenHost:
   const syncs: any[] = hist.data?.syncs ?? [];
   const exec = pre?.suggested_plan.exec;
   const hostName = host?.name ?? 'host';
+  const [menuNode, openMenu] = useMenu();
+  const alias: string | undefined = usePoll(() => (dest?.host_id ? call('getHost', { host_id: dest.host_id }) : Promise.resolve(null)), [dest?.host_id], 60_000).data?.ssh_alias;
+  const say = (p: Promise<unknown>) => p.then((m) => { if (typeof m === 'string') setNote(m); }, (e) => setErr(errText(e)));
+  const ignore = async (pattern: string) => {
+    try { await call('editProjectIgnore', { project_id: project.id, add: [pattern] }); setSelFile(null); setNote(`Added “${pattern}” to .sshrmignore`); check(); } catch (e) { setErr(errText(e)); }
+  };
 
   const check = async () => {
     if (!project || !dest) return;
@@ -198,6 +231,63 @@ Continue?`)) return;
   const destPath = pre?.summary.destination.path ?? dest?.canonical_path ?? dest?.path_input;
   const srcPath = source?.canonical_path ?? source?.path_input;
   const selected = syncs.find((s) => s.id === selSync);
+  // ── right-click menus ──
+  const fileMenu = (r: FileRow): MenuItem[] => {
+    const lp = localPath(srcPath, r.p), hp = hostPath(destPath, r.p);
+    const dir = r.p.slice(0, r.p.lastIndexOf('/') + 1), ext = /[^/.]\.([^./]+)$/.exec(r.p)?.[1]; // "a/b.mp3" → mp3; dotfiles like ".firebaserc" have none
+    return [
+      { label: 'Open diff', icon: '⇆', onClick: () => setSelFile(r.p) },
+      '-',
+      ...(r.m === 'D' ? [{ label: 'Not on this PC', icon: '📄', disabled: true, onClick: () => {} }] : localFileItems(lp)),
+      r.m !== 'A' && { label: `Open ${hostName}'s copy in VS Code`, icon: '🖥', title: alias ? '' : 'Needs an SSH key login on this host: copies an SSH command instead', onClick: () => say(openOnHost(dest.host_id, hp)) },
+      '-',
+      r.m !== 'D' && copyItem('Copy path', lp), copyItem('Copy relative path', r.p), r.m !== 'A' && copyItem(`Copy path on ${hostName}`, hp),
+      '-',
+      { label: 'Ignore this file', icon: '🚫', onClick: () => ignore(r.p) },
+      dir && { label: <>Ignore folder <span className="mono">{dir}</span></>, icon: '🚫', onClick: () => ignore(dir) },
+      ext && { label: <>Ignore all <span className="mono">*.{ext}</span></>, icon: "🚫", onClick: () => ignore(`*.${ext}`) },
+      '-',
+      keptCount > 0 && { label: show === 'kept' ? 'Hide files the sync leaves alone' : `Show ${plural(keptCount, 'file')} the sync leaves alone`, icon: '⌂', onClick: () => setShow(show === 'kept' ? 'all' : 'kept') },
+    ];
+  };
+  const projectMenu = (p: any): MenuItem[] => {
+    const dir = sourceDir(p);
+    return [
+      p.id !== project?.id && { label: 'Open', icon: '▣', onClick: () => pickProject(p.id) },
+      ...localFileItems(dir, true),
+      dir && { label: 'Edit .sshrmignore', icon: '🚫', title: 'Paths left out of sync and checks', onClick: () => say(window.api.openIgnoreFile(dir).then((r) => (r === true ? null : Promise.reject(new Error(r === 'missing' ? 'The source folder is not on this PC' : r))))) },
+      copyItem('Copy folder path', dir),
+      '-',
+      { label: 'New mapping…', icon: '＋', onClick: () => { setMenu(null); setAdding(''); } },
+      '-',
+      { label: 'Remove project…', icon: '🗑', danger: true, onClick: async () => {
+        if (!confirm(`Remove the project "${p.name}" and all its host mappings?\n\nMetadata only: no folder on any machine is touched.`)) return;
+        try { await call('removeProject', { project_id: p.id, expected_revision: p.revision }); setMenu(null); reload(); } catch (e) { setErr(errText(e)); }
+      } },
+    ];
+  };
+  const destMenu = (l: any): MenuItem[] => {
+    const h = hosts.find((x) => x.id === l.host_id), name = h?.name ?? 'host', cur = l.id === dest?.id, path = l.canonical_path ?? l.path_input;
+    return [
+      !cur && { label: 'Select', icon: '✓', onClick: () => pickDest(l.id) },
+      cur && !!l.path_input && { label: 'Refresh', icon: '⟳', disabled: !!busy, onClick: () => { setMenu(null); check(); } },
+      cur && exec && { label: `Sync to ${name}`, icon: '⇡', disabled: !!busy, onClick: () => { setMenu(null); sync(); } },
+      '-',
+      path && { label: `Open folder on ${name}`, icon: '🖥', onClick: () => say(openOnHost(l.host_id, path)) },
+      copyItem(`Copy path on ${name}`, path),
+      { label: `Open ${name}'s page`, icon: '↗', onClick: () => { setMenu(null); onOpenHost(l.host_id); } },
+      '-',
+      { label: 'Remove mapping…', icon: '🗑', danger: true, onClick: async () => { try { if (await removeMapping(project, l, name)) { setMenu(null); reload(); } } catch (e) { setErr(errText(e)); } } },
+    ];
+  };
+  const syncMenu = (s: any): MenuItem[] => [
+    { label: 'Show details', icon: '☰', onClick: () => setSelSync(s.id) },
+    '-',
+    copyItem('Copy commit hash', s.head), copyItem('Copy branch', s.branch), copyItem('Copy operation id', s.operation_id),
+    '-',
+    { label: 'Check again now', icon: '⟳', disabled: !!busy || !dest?.path_input, onClick: () => { setTab('changes'); check(); } },
+  ];
+
   const dialog = adding !== null && <MappingDialog hosts={hosts} hostId={adding} projects={projects} onClose={() => { setAdding(null); reload(); }} />;
 
   if (data && projects.length === 0) {
@@ -216,9 +306,9 @@ Continue?`)) return;
     <div className="gd-body" style={{ '--side-w': `${sideW}px` } as React.CSSProperties}>
       {/* ── Toolbar ─────────────────────────────────────────── */}
       <div className="gd-toolbar">
-        <ToolbarItem icon="▣" label="Current project" value={project?.name ?? '…'} open={menu === 'project'} onClick={() => setMenu(menu === 'project' ? null : 'project')} />
-        <ToolbarItem icon="🖥" label="Current destination" value={dest ? `${hostName}${dest.label && dest.label !== host?.name ? ` · ${dest.label}` : ''}` : 'None'} open={menu === 'dest'} onClick={() => setMenu(menu === 'dest' ? null : 'dest')} />
-        <ToolbarItem icon="⑂" label="Current branch" value={branch} />
+        <ToolbarItem onContextMenu={(e) => project && openMenu(e, projectMenu(project), project.name)} icon="▣" label="Current project" value={project?.name ?? '…'} open={menu === 'project'} onClick={() => setMenu(menu === 'project' ? null : 'project')} />
+        <ToolbarItem onContextMenu={(e) => dest && openMenu(e, destMenu(dest), hostName)} icon="🖥" label="Current destination" value={dest ? `${hostName}${dest.label && dest.label !== host?.name ? ` · ${dest.label}` : ''}` : 'None'} open={menu === 'dest'} onClick={() => setMenu(menu === 'dest' ? null : 'dest')} />
+        <ToolbarItem onContextMenu={(e) => openMenu(e, [copyItem('Copy branch name', pre?.summary.source.branch ?? source?.last_inspection?.branch), copyItem('Copy commit hash', pre?.summary.source.head ?? source?.last_inspection?.head)])} icon="⑂" label="Current branch" value={branch} />
         <ToolbarItem icon={busy === 'check' ? '◌' : '⟳'} label="" value={busy === 'check' ? `Refreshing…` : `Refresh`} sub={checkedAt ? `Checked ${age(checkedAt)} · this PC and ${hostName}` : 'Not checked yet'}
           onClick={check} disabled={!!busy || !dest?.path_input} />
         {menu && <div className="gd-scrim" onClick={() => setMenu(null)} />}
@@ -227,7 +317,7 @@ Continue?`)) return;
             <div className="gd-pop-head"><input autoFocus placeholder="Filter" value={filter} onChange={(e) => setFilter(e.target.value)} /><button onClick={() => { setMenu(null); setAdding(''); }}>New mapping</button></div>
             <div className="gd-pop-section">Projects</div>
             {projects.filter((p) => p.name.toLowerCase().includes(filter.toLowerCase())).map((p) => (
-              <button key={p.id} className="gd-pop-item" onClick={() => pickProject(p.id)}>
+              <button key={p.id} className="gd-pop-item" onClick={() => pickProject(p.id)} onContextMenu={(e) => openMenu(e, projectMenu(p), p.name)}>
                 <span className="gd-check">{p.id === project?.id ? '✓' : ''}</span><span className="grow-1 ellipsis">{p.name}</span>
                 <span className="muted small">{plural(p.locations.filter((l: any) => l.role !== 'source').length, 'host')}</span>
               </button>
@@ -238,13 +328,13 @@ Continue?`)) return;
           <div className="gd-pop" style={{ left: 'var(--side-w)' }}>
             <div className="gd-pop-head"><span className="grow-1 muted small ellipsis">{project?.name}</span><button onClick={() => { setMenu(null); setAdding(''); }}>New mapping</button></div>
             <div className="gd-pop-section">Source</div>
-            <div className="gd-pop-item static"><span className="gd-check">💻</span><span className="grow-1">This PC</span><span className="muted small mono ellipsis">{srcPath}</span></div>
+            <div className="gd-pop-item static" onContextMenu={(e) => openMenu(e, [...localFileItems(srcPath, true), copyItem('Copy folder path', srcPath)], 'This PC')}><span className="gd-check">💻</span><span className="grow-1">This PC</span><span className="muted small mono ellipsis">{srcPath}</span></div>
             <div className="gd-pop-section">Destinations</div>
             {dests.length === 0 && <div className="gd-pop-item static muted">Not mapped to any host yet.</div>}
             {dests.map((l) => {
               const h = hosts.find((x) => x.id === l.host_id);
               return (
-                <button key={l.id} className="gd-pop-item" onClick={() => pickDest(l.id)}>
+                <button key={l.id} className="gd-pop-item" onClick={() => pickDest(l.id)} onContextMenu={(e) => openMenu(e, destMenu(l), h?.name ?? 'host')}>
                   <span className="gd-check">{l.id === dest?.id ? '✓' : ''}</span>
                   {h && <StatusDot s={h.status} />}
                   <span className="grow-1 ellipsis">{h?.name ?? 'unknown host'}{l.label && l.label !== h?.name ? ` · ${l.label}` : ''}</span>
@@ -277,9 +367,9 @@ Continue?`)) return;
               {dirtyCount > 0 && <div className="gd-list-hint">! = edited on {hostName}; this PC doesn't have that version. Sync won't overwrite it unless you back it up first.</div>}
               {keptCount > 0 && <button className="gd-list-hint link" onClick={() => setShow(show === 'kept' ? 'all' : 'kept')} title="Files only on the host, or host edits to files this PC hasn't changed: Sync leaves them as they are">⌂ {show === 'kept' ? 'Hide' : 'Show'} {plural(keptCount, 'file')} on {hostName} the sync leaves alone</button>}
               <div className="gd-list">
-                {commitLine && <div className="gd-file commit" title={`${pre.summary.source.head} → ${hostName}`}><span className="grow-1 ellipsis">⊶ {commitLine} → {pre.summary.source.head?.slice(0, 7)}</span><span className="gd-mark A">⇡</span></div>}
+                {commitLine && <div className="gd-file commit" onContextMenu={(e) => openMenu(e, [copyItem('Copy commit hash', pre.summary.source.head), copyItem('Copy branch', exec.branch), copyItem(`Copy ${hostName}'s commit hash`, pre.summary.destination.head)])} title={`${pre.summary.source.head} → ${hostName}`}><span className="grow-1 ellipsis">⊶ {commitLine} → {pre.summary.source.head?.slice(0, 7)}</span><span className="gd-mark A">⇡</span></div>}
                 {rows.map((r) => (
-                  <button key={r.p} className={`gd-file ${r.p === selFile ? 'sel' : ''}`} title={`${r.p}\n${r.t}`} onClick={() => setSelFile(r.p)}>
+                  <button key={r.p} className={`gd-file ${r.p === selFile ? 'sel' : ''}`} title={`${r.p}\n${r.t}`} onClick={() => setSelFile(r.p)} onContextMenu={(e) => { setSelFile(r.p); openMenu(e, fileMenu(r), r.p); }}>
                     <span className="gd-path"><span className="gd-dir">{r.p.slice(0, r.p.lastIndexOf('/') + 1)}</span><span className="gd-name">{r.p.slice(r.p.lastIndexOf('/') + 1)}</span></span>
                     {r.dirty && <span className="gd-mark dirty" title={`Edited on ${hostName}: this PC doesn't have that version`}>!</span>}
                     <span className={`gd-mark ${r.m}`} title={r.m === 'K' ? `Kept: ${hostName}'s edit stays` : undefined}>{r.m === 'M' ? '•' : r.m === 'A' ? '+' : r.m === 'K' ? '⌂' : '−'}</span>
@@ -302,7 +392,7 @@ Continue?`)) return;
               {syncs.map((s) => {
                 const o = OUTCOME[s.outcome] ?? { icon: '?', cls: '', text: s.outcome };
                 return (
-                  <button key={s.id} className={`gd-hist ${s.id === selSync ? 'sel' : ''}`} onClick={() => setSelSync(s.id)}>
+                  <button key={s.id} className={`gd-hist ${s.id === selSync ? 'sel' : ''}`} onClick={() => setSelSync(s.id)} onContextMenu={(e) => { setSelSync(s.id); openMenu(e, syncMenu(s)); }}>
                     <span className="gd-hist-title ellipsis"><span className={`gd-oc ${o.cls}`}>{o.icon}</span> {s.transfer_mode === 'gui_sync' ? 'Sync now' : s.transfer_mode ? `Transfer (${s.transfer_mode})` : 'Agent transfer'}{s.branch ? ` · ${s.branch}` : ''}</span>
                     <span className="gd-hist-sub">{s.head ? `${s.head.slice(0, 7)} · ` : ''}{o.text} · {age(s.started_at)}</span>
                   </button>
@@ -316,8 +406,7 @@ Continue?`)) return;
         {/* ── Main pane ────────────────────────────────────── */}
         <main className="gd-main">
           {tab === 'changes' && selRow ? (
-            <FileDiff key={selRow.p} projectId={project.id} destId={dest.id} row={selRow} hostName={hostName} onClose={() => setSelFile(null)}
-              onIgnore={async (pattern) => { try { await call('editProjectIgnore', { project_id: project.id, add: [pattern] }); setSelFile(null); setNote(`Added “${pattern}” to .sshrmignore`); check(); } catch (e) { setErr(errText(e)); } }} />
+            <FileDiff key={selRow.p} projectId={project.id} destId={dest.id} row={selRow} hostName={hostName} onClose={() => setSelFile(null)} onMenu={(e) => openMenu(e, fileMenu(selRow), selRow.p)} />
           ) : tab === 'history' ? (
             selected ? <SyncDetail s={selected} /> : <div className="gd-blank"><h1>History</h1><p className="muted">Every verification after a transfer to {hostName} is listed on the left: the commit it was checked against and whether both sides matched.</p></div>
           ) : (
@@ -368,6 +457,7 @@ Continue?`)) return;
         </main>
       </div>
       {dialog}
+      {menuNode}
     </div>
   );
 }
@@ -388,10 +478,9 @@ function parseDiff(diff: string): DiffLine[] {
 }
 
 /** GitHub Desktop's diff view: the host's copy is the old side (−), this PC is the new side (+). */
-function FileDiff({ projectId, destId, row, hostName, onClose, onIgnore }: { projectId: string; destId: string; row: FileRow; hostName: string; onClose: () => void; onIgnore: (pattern: string) => void }) {
+function FileDiff({ projectId, destId, row, hostName, onClose, onMenu }: { projectId: string; destId: string; row: FileRow; hostName: string; onClose: () => void; onMenu: (e: React.MouseEvent) => void }) {
   const [d, setD] = useState<any>(null);
-  const [ign, setIgn] = useState(false);
-  const dir = row.p.slice(0, row.p.lastIndexOf('/') + 1), ext = /\.[^./]+$/.exec(row.p)?.[0];
+  const [lineMenu, openLineMenu] = useMenu();
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => { call('diffProjectFile', { project_id: projectId, destination_location_id: destId, path: row.p }).then(setD, (e) => setErr(errText(e))); }, [projectId, destId, row.p]);
   const lines = d?.diff ? parseDiff(d.diff) : d?.text != null ? d.text.split('\n').map((t: string, i: number) => ({ k: 'ctx', o: i + 1, n: i + 1, t })) : [];
@@ -404,8 +493,7 @@ function FileDiff({ projectId, destId, row, hostName, onClose, onIgnore }: { pro
       <div className="gd-diff-head">
         <span className="gd-path"><span className="gd-dir">{row.p.slice(0, row.p.lastIndexOf('/') + 1)}</span><span className="gd-name">{row.p.slice(row.p.lastIndexOf('/') + 1)}</span></span>
         {d?.diff && <span className="gd-diff-stat"><span className="add">+{adds}</span> <span className="del">−{dels}</span></span>}
-        {ign ? <span className="gd-ignore">Ignore: <button className="ghost" onClick={() => onIgnore(row.p)}>this file</button>{dir && <button className="ghost" onClick={() => onIgnore(dir)}>{dir}</button>}{ext && <button className="ghost" onClick={() => onIgnore(`*${ext}`)}>all *{ext}</button>}<button className="ghost" onClick={() => setIgn(false)}>Cancel</button></span>
-          : <button className="ghost" onClick={() => setIgn(true)} title="Add to .sshrmignore: Sync and the check leave it out on both sides">Ignore…</button>}
+        <button className="ghost" onClick={onMenu} onContextMenu={onMenu} title="Open, Show in Explorer, copy path, ignore…">⋯</button>
         <button className="ghost" onClick={onClose} title="Back to overview">✕</button>
       </div>
       <div className={`gd-diff-sub ${row.dirty ? 'dirty' : ''}`}>{row.dirty ? '! ' : ''}{row.t} <span className="muted">· <span className="del">−</span> {hostName} · <span className="add">+</span> this PC</span></div>
@@ -420,11 +508,12 @@ function FileDiff({ projectId, destId, row, hostName, onClose, onIgnore }: { pro
           <table className="gd-diff-table"><tbody>
             {shown.map((l: DiffLine, i: number) => l.k === 'hunk'
               ? <tr key={i} className="hunk"><td className="ln" /><td className="ln" /><td className="code">{l.t}</td></tr>
-              : <tr key={i} className={l.k}><td className="ln">{l.o ?? ''}</td><td className="ln">{l.n ?? ''}</td><td className="code"><span className="sign">{l.k === 'add' ? '+' : l.k === 'del' ? '−' : ' '}</span>{l.t}</td></tr>)}
+              : <tr key={i} className={l.k} onContextMenu={(e) => openLineMenu(e, [copyItem('Copy selection', window.getSelection()?.toString().trim()), copyItem('Copy line', l.t || ' '), copyItem('Copy whole diff', d?.diff ?? d?.text), '-', copyItem('Copy file path', row.p)])}><td className="ln">{l.o ?? ''}</td><td className="ln">{l.n ?? ''}</td><td className="code"><span className="sign">{l.k === 'add' ? '+' : l.k === 'del' ? '−' : ' '}</span>{l.t}</td></tr>)}
           </tbody></table>
         )}
         {lines.length > shown.length && <div className="gd-diff-note muted">{lines.length - shown.length} more lines not shown.</div>}
       </div>
+      {lineMenu}
     </div>
   );
 }
@@ -489,7 +578,7 @@ function HostList({ onOpen, onAdd, onEdit }: { onOpen: (id: string) => void; onA
   const running = useRef(new Set<string>());
 
   // Context menu & action states
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; host: HostSummary } | null>(null);
+  const [menuNode, openMenu] = useMenu();
   const [renameTarget, setRenameTarget] = useState<HostSummary | null>(null);
   const [renameInput, setRenameInput] = useState('');
   const [dupTarget, setDupTarget] = useState<HostSummary | null>(null);
@@ -512,36 +601,31 @@ function HostList({ onOpen, onAdd, onEdit }: { onOpen: (id: string) => void; onA
     return () => clearInterval(t);
   }, [settings?.gui_auto_check, data]);
 
-  // Click outside / keydown to dismiss context menu & dialogs
+  // Escape closes the dialogs (the menu closes itself)
   useEffect(() => {
-    const handleGlobalClick = () => setContextMenu(null);
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setContextMenu(null);
-        setRenameTarget(null);
-        setDupTarget(null);
-        setDeleteTarget(null);
-      }
-    };
-    window.addEventListener('click', handleGlobalClick);
-    window.addEventListener('contextmenu', handleGlobalClick);
-    window.addEventListener('keydown', handleKeyDown);
-    return () => {
-      window.removeEventListener('click', handleGlobalClick);
-      window.removeEventListener('contextmenu', handleGlobalClick);
-      window.removeEventListener('keydown', handleKeyDown);
-    };
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') { setRenameTarget(null); setDupTarget(null); setDeleteTarget(null); } };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
   }, []);
 
-  const openContextMenu = (e: React.MouseEvent, h: HostSummary) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const menuWidth = 200;
-    const menuHeight = 180;
-    const x = e.clientX + menuWidth > window.innerWidth ? window.innerWidth - menuWidth - 10 : e.clientX;
-    const y = e.clientY + menuHeight > window.innerHeight ? window.innerHeight - menuHeight - 10 : e.clientY;
-    setContextMenu({ x, y, host: h });
-  };
+  const done = (m: string) => { setActionErr(null); setActionSuccess(m); setTimeout(() => setActionSuccess(null), 3000); };
+  const act = (p: Promise<unknown>) => p.then((m) => typeof m === 'string' && done(m), (e) => setActionErr(errText(e))).finally(reload);
+  const openContextMenu = (e: React.MouseEvent, h: HostSummary) => openMenu(e, [
+    { label: 'Open', icon: '↗', onClick: () => onOpen(h.id) },
+    { label: 'Check now', icon: '⟳', onClick: () => act(checkHost(h.id).then((r) => (r.success ? `${h.name} is reachable${r.key_auth ? ` · ${r.key_auth}` : ''}` : Promise.reject(new Error(`${r.error?.code}: ${r.error?.message}`))))) },
+    '-',
+    { label: 'Copy SSH command', icon: '📋', onClick: () => act(call('connectionRecipe', { host_id: h.id, caller_environment: ENV }).then((r) => copy(r.display)).then(() => 'SSH command copied')) },
+    { label: 'Copy scp template', icon: '📋', onClick: () => act(call('connectionRecipe', { host_id: h.id, caller_environment: ENV, purpose: 'file_transfer' }).then((r) => copy(r.display)).then(() => 'scp template copied')) },
+    copyItem('Copy address', h.active_address ?? h.target),
+    { label: 'Open in VS Code (Remote)', icon: '⌨', onClick: () => act(call('getHost', { host_id: h.id }).then((x) => openOnHost(h.id, x.default_remote_directory || '~'))) },
+    '-',
+    { label: 'Edit Host', icon: '✏️', onClick: () => onEdit(h.id) },
+    { label: 'Rename…', icon: '🏷️', onClick: () => { setRenameTarget(h); setRenameInput(h.name); } },
+    { label: 'Duplicate Host…', icon: '📋', onClick: () => { setDupTarget(h); setDupInput(`${h.name} (Copy)`); setDupCopyPassword(true); } },
+    { label: h.enabled ? 'Disable' : 'Enable', icon: h.enabled ? '⏸' : '▶', onClick: () => act(call('updateHost', { host_id: h.id, expected_revision: h.revision, patch: { metadata: { enabled: !h.enabled } }, idempotency_key: idem() }).then(() => `${h.name} ${h.enabled ? 'disabled' : 'enabled'}`)) },
+    '-',
+    { label: 'Delete Host…', icon: '🗑️', danger: true, onClick: () => setDeleteTarget(h) },
+  ], h.name);
 
   const handleRename = async () => {
     if (!renameTarget || !renameInput.trim()) return;
@@ -698,67 +782,7 @@ function HostList({ onOpen, onAdd, onEdit }: { onOpen: (id: string) => void; onA
         </table>
       )}
 
-      {/* ── Context Menu ────────────────────────────────────────── */}
-      {contextMenu && (
-        <div
-          className="context-menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="context-menu-header mono small">
-            {contextMenu.host.name}
-          </div>
-          <button
-            className="context-menu-item"
-            onClick={() => {
-              const h = contextMenu.host;
-              setContextMenu(null);
-              onEdit(h.id);
-            }}
-          >
-            <span className="menu-icon">✏️</span>
-            <span>Edit Host</span>
-          </button>
-          <button
-            className="context-menu-item"
-            onClick={() => {
-              const h = contextMenu.host;
-              setContextMenu(null);
-              setRenameTarget(h);
-              setRenameInput(h.name);
-            }}
-          >
-            <span className="menu-icon">🏷️</span>
-            <span>Rename…</span>
-          </button>
-          <button
-            className="context-menu-item highlight"
-            onClick={() => {
-              const h = contextMenu.host;
-              setContextMenu(null);
-              setDupTarget(h);
-              setDupInput(`${h.name} (Copy)`);
-              setDupCopyPassword(true);
-            }}
-          >
-            <span className="menu-icon">📋</span>
-            <span>Duplicate Host…</span>
-            <span className="badge-new">New</span>
-          </button>
-          <div className="context-menu-sep" />
-          <button
-            className="context-menu-item danger"
-            onClick={() => {
-              const h = contextMenu.host;
-              setContextMenu(null);
-              setDeleteTarget(h);
-            }}
-          >
-            <span className="menu-icon">🗑️</span>
-            <span>Delete Host…</span>
-          </button>
-        </div>
-      )}
+      {menuNode}
 
       {/* ── Rename Modal ────────────────────────────────────────── */}
       {renameTarget && (
@@ -1093,6 +1117,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
   const [lastCheck, setLastCheck] = useState<any>(null);
   const [probes, setProbes] = useState('binary:git');
   const [busy, setBusy] = useState(false);
+  const [menuNode, openMenu] = useMenu();
   const act = async (fn: () => Promise<unknown>) => {
     setBusy(true);
     setErr(null);
@@ -1165,7 +1190,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
             {h.auth === 'password' && h.password_stored && h.profile.mode === 'direct' && <> <button disabled={busy} title="Generates an SSH key on this PC, installs it on the host using the stored password, tests a key-only login, then switches. The password stays stored."
               onClick={() => act(async () => { const r = await call('switchToKeyAuth', { host_id: id }); setSuccessMsg(r.note); })}>Switch to SSH key</button></>}
             {h.ssh_alias && <> · from any terminal: <span className="mono">ssh {h.ssh_alias}</span></>}</p>
-          <p>Trusted keys: {h.trust.length ? h.trust.map((t: any) => `${t.algorithm} ${t.fingerprint} (${age(t.approved_at)})`).join('; ') : h.profile.mode === 'ssh_alias' ? 'user-managed known_hosts' : 'none'}</p>
+          <p>Trusted keys: {h.trust.length ? h.trust.map((t: any, i: number) => <span key={t.fingerprint} onContextMenu={(e) => openMenu(e, [copyItem('Copy fingerprint', t.fingerprint), copyItem('Copy algorithm + fingerprint', `${t.algorithm} ${t.fingerprint}`)])}>{i ? '; ' : ''}<span className="mono">{t.algorithm} {t.fingerprint}</span> ({age(t.approved_at)})</span>) : h.profile.mode === 'ssh_alias' ? 'user-managed known_hosts' : 'none'}</p>
           <h3>Description</h3><p className="pre">{h.description || <span className="muted">—</span>}</p>
           <h3>Instructions</h3><p className="pre">{h.instructions || <span className="muted">—</span>}</p>
           {h.default_remote_directory && <p>Default remote directory: <span className="mono">{h.default_remote_directory}</span></p>}
@@ -1175,7 +1200,7 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
           <h3>Capabilities</h3>
           <p className="muted small">Declared is a claim. Observed comes from a probe at a point in time.</p>
           <table className="inline-table"><thead><tr><th>Key</th><th>Declared</th><th>Observed</th></tr></thead><tbody>
-            {h.capabilities.map((c: any) => <tr key={c.key}><td className="mono">{c.key}</td><td>{c.label || c.declared_description || '✓'} <span className="muted">({c.declaration_source})</span></td>
+            {h.capabilities.map((c: any) => <tr key={c.key} onContextMenu={(e) => openMenu(e, [{ label: 'Probe again', icon: '⟳', disabled: busy, onClick: () => act(async () => setLastCheck(await call('probeCapabilities', { host_id: id, probe_ids: [c.key] }))) }, '-', copyItem('Copy key', c.key), copyItem('Copy result', c.observation?.details)], c.key)}><td className="mono">{c.key}</td><td>{c.label || c.declared_description || '✓'} <span className="muted">({c.declaration_source})</span></td>
               <td>{c.observation ? <><span className={`badge cap-${c.observation.state}`}>{c.observation.state}</span> {age(c.observed_at)}<div className="muted small pre">{c.observation.details}</div></> : <span className="muted">not probed</span>}</td></tr>)}
           </tbody></table>
           <div className="row"><input className="mono grow" value={probes} onChange={(e) => setProbes(e.target.value)} title="comma separated: macos.xcode, binary:git" />
@@ -1186,12 +1211,13 @@ function HostDetail({ id, onBack, onEdit }: { id: string; onBack: () => void; on
             : <ul>{h.resources.map((r: any) => <li key={r.id}>{r.label} <span className="muted">({r.resource_kind})</span></li>)}</ul>}
           <h3>History</h3>
           <table className="inline-table small"><thead><tr><th>When</th><th>Kind</th><th>Outcome</th><th>ms</th></tr></thead><tbody>
-            {(hist.data?.checks ?? []).map((c: any) => <tr key={c.id} title={c.diagnostics?.stderr ?? ''}><td>{age(c.started_at)}</td><td>{c.kind}</td>
+            {(hist.data?.checks ?? []).map((c: any) => <tr key={c.id} title={c.diagnostics?.stderr ?? ''} onContextMenu={(e) => openMenu(e, [copyItem('Copy error output', c.diagnostics?.stderr), copyItem('Copy error code', c.error_code), copyItem('Copy time', new Date(c.started_at).toLocaleString())])}><td>{age(c.started_at)}</td><td>{c.kind}</td>
               <td>{c.outcome ?? 'running'} {c.error_code}{c.identity_generation !== h.identity_generation ? ' (old settings)' : ''}</td><td>{c.duration_ms}</td></tr>)}
           </tbody></table>
         </div>
       </div>
       <HostProjects host={h} />
+      {menuNode}
     </section>
   );
 }
@@ -1212,6 +1238,7 @@ function RemoteFolderPicker({ hostId, start, onPick, onClose }: { hostId: string
     call('listRemoteDir', { host_id: hostId, path }).then((r) => { setRes(r); if (r.path) setTyped(r.path); }).catch((e) => setErr(errText(e))).finally(() => setLoading(false));
   }, [hostId, path]);
   const join = (base: string, name: string) => (base.endsWith('/') ? base + name : `${base}/${name}`);
+  const [menuNode, openMenu] = useMenu();
   return (
     <div className="modal-back" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -1228,15 +1255,17 @@ function RemoteFolderPicker({ hostId, start, onPick, onClose }: { hostId: string
           {loading && <p className="muted">Loading…</p>}
           {!loading && res?.entries?.length === 0 && !res.error && <p className="muted">No sub-folders.</p>}
           {!loading && res?.entries?.map((e: any) => (
-            <div key={e.name} className={`picker-item ${e.name.startsWith('.') ? 'dim' : ''}`} onDoubleClick={() => setPath(join(res.path, e.name))} onClick={() => setTyped(join(res.path, e.name))}>
+            <div key={e.name} className={`picker-item ${e.name.startsWith('.') ? 'dim' : ''}`} onDoubleClick={() => setPath(join(res.path, e.name))} onClick={() => setTyped(join(res.path, e.name))}
+              onContextMenu={(ev) => { const p = join(res.path, e.name); setTyped(p); openMenu(ev, [{ label: 'Open', icon: '📂', onClick: () => setPath(p) }, { label: 'Use this folder', icon: '✓', onClick: () => onPick(p) }, '-', copyItem('Copy path', p)], e.name); }}>
               📁 {e.name} {e.git && <span className="badge st-reachable">git</span>} {e.project_marker && <span className="badge">project</span>}
             </div>
           ))}
         </div>
         <div className="row">
-          <span className="muted small grow">Double-click to open · click to select</span>
+          <span className="muted small grow">Double-click to open · click to select · right-click for more</span>
           <button className="primary" disabled={!typed || !!res?.error && typed === res?.path} onClick={() => onPick(typed)}>Use "{typed.length > 40 ? '…' + typed.slice(-40) : typed}"</button>
         </div>
+        {menuNode}
       </div>
     </div>
   );
@@ -1368,6 +1397,25 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
   const [synced, setSynced] = useState<string | null>(null);
   const run = async (label: string, fn: () => Promise<unknown>) => { setBusy(label); setErr(null); setSynced(null); try { await fn(); } catch (e) { setErr(errText(e)); } finally { setBusy(null); reload(); } };
   const exec = pre?.suggested_plan.exec;
+  const [menuNode, openMenu] = useMenu();
+  const preflight = () => run('pre', async () => setPre(await call('preflightProject', { project_id: project.id, destination_location_id: dest.id, intent: 'build' })));
+  const syncNow = () => run('sync', async () => { const r = await call('syncProject', { project_id: project.id, destination_location_id: dest.id }); setPre(null); setSynced(r.note); });
+  const srcDir = source?.canonical_path ?? source?.path_input, dstDir = dest.canonical_path ?? dest.path_input;
+  const menu = (e: React.MouseEvent) => openMenu(e, [
+    { label: 'Preflight', icon: '⟳', disabled: !!busy, onClick: preflight },
+    exec && { label: 'Sync now', icon: '⇡', disabled: !!busy, onClick: syncNow },
+    { label: 'Open in Projects view', icon: '▣', onClick: () => openInProjects(project.id, dest.id) },
+    '-',
+    ...localFileItems(srcDir, true),
+    dstDir && { label: `Open folder on ${host.name}`, icon: '🖥', onClick: () => run('open', async () => setSynced(await openOnHost(host.id, dstDir))) },
+    '-',
+    copyItem('Copy source path', srcDir), copyItem(`Copy path on ${host.name}`, dstDir),
+    '-',
+    { label: 'Change source path…', icon: '✏️', onClick: () => setEdit({ which: 'src', value: source?.path_input ?? '' }) },
+    { label: 'Change destination path…', icon: '✏️', onClick: () => setEdit({ which: 'dst', value: dest.path_input ?? '' }) },
+    '-',
+    { label: 'Remove mapping…', icon: '🗑', danger: true, onClick: () => run('rm', () => removeMapping(project, dest, host.name)) },
+  ], `${project.name} → ${host.name}`);
   const syncLabel = exec && [{ git_clone: 'clone', git_switch: 'switch branch', git_fast_forward: 'fast-forward' }[pre.suggested_plan.kind as string],
     exec.copy.length ? `${exec.copy.length} file${exec.copy.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' + ');
   const gitLine = (l: any) => l?.last_inspection ? `${l.last_inspection.branch ?? (l.last_inspection.detached ? 'detached' : 'no git')}${l.last_inspection.head ? ' ' + l.last_inspection.head.slice(0, 8) : ''}${l.last_inspection.dirty && (l.last_inspection.dirty.staged + l.last_inspection.dirty.unstaged + l.last_inspection.dirty.untracked) ? ` · ${l.last_inspection.dirty.staged + l.last_inspection.dirty.unstaged + l.last_inspection.dirty.untracked} uncommitted` : ''} · ${age(l.last_inspection.at)}` : 'not inspected';
@@ -1395,25 +1443,18 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
     </div>
   );
   return (
-    <div className="mapping">
+    <div className="mapping" onContextMenu={menu}>
       <div className="row">
         <b>{project.name}</b>
         {dest.label && dest.label !== host.name && <span className="badge" title="working setup">{dest.label}</span>}
         <span className={`badge id-${dest.identity_state}`} title="identity of the destination folder">{dest.identity_state.replace('_', ' ')}</span>
         <span className="small muted">{dest.last_verified_sync ? `synced & verified ${age(dest.last_verified_sync.verified_at)}` : 'never verified'}{dest.last_sync_attempt && !dest.last_verified_sync ? ` · last attempt ${dest.last_sync_attempt.outcome}` : ''}</span>
         <span className="grow" />
-        <button disabled={!!busy} onClick={() => run('pre', async () => setPre(await call('preflightProject', { project_id: project.id, destination_location_id: dest.id, intent: 'build' })))}>{busy === 'pre' ? 'Checking…' : 'Preflight'}</button>
-        {exec && <button className="primary" disabled={!!busy} title="Runs the plan below over SSH (fast-forward only, never overwrites destination work), then verifies"
-          onClick={() => run('sync', async () => { const r = await call('syncProject', { project_id: project.id, destination_location_id: dest.id }); setPre(null); setSynced(r.note); })}>
+        <button disabled={!!busy} onClick={preflight}>{busy === 'pre' ? 'Checking…' : 'Preflight'}</button>
+        {exec && <button className="primary" disabled={!!busy} title="Runs the plan below over SSH (fast-forward only, never overwrites destination work), then verifies" onClick={syncNow}>
           {busy === 'sync' ? 'Syncing…' : `Sync now${syncLabel ? ` (${syncLabel})` : ''}`}</button>}
-        <button className="danger" onClick={() => {
-          const onlyHost = project.locations.filter((l: any) => l.role !== 'source').length === 1;
-          if (!confirm(`Remove the mapping of "${project.name}" to ${host.name}?\n\nMetadata only: no folder on either machine is touched.${onlyHost ? '\nThe project itself is removed too (it has no other hosts).' : ''}`)) return;
-          run('rm', async () => {
-            await call('unbindProjectLocation', { location_id: dest.id, expected_revision: dest.revision });
-            if (onlyHost) { const p = await call('getProject', { project_id: project.id }); await call('removeProject', { project_id: project.id, expected_revision: p.revision }); }
-          });
-        }}>Remove</button>
+        <button className="danger" onClick={() => run('rm', () => removeMapping(project, dest, host.name))}>Remove</button>
+        <button className="ghost" onClick={menu} title="More actions">⋯</button>
       </div>
       <Err e={err} />
       {synced && <div className="small">✓ {synced}</div>}
@@ -1432,6 +1473,7 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
           <ol className="small">{pre.suggested_plan.steps.map((s: string, i: number) => <li key={i}>{s}</li>)}</ol>
         </div>
       )}
+      {menuNode}
     </div>
   );
 }
@@ -1442,78 +1484,109 @@ function MappingCard({ project, source, dest, host, reload }: { project: any; so
 
 
 
-function QuickBindSection({ mcpConfigJson }: { mcpConfigJson: string }) {
-  const [copyMsg, setCopyMsg] = useState<string | null>(null);
+const AGENT_ICON: Record<string, [string, string]> = {
+  'claude-desktop': ['🟠', 'claude'], 'claude-code': ['🟠', 'claude'], codex: ['🟢', 'codex'], gemini: ['🔵', 'antigravity'],
+  antigravity: ['🔵', 'antigravity'], cursor: ['⚫', ''], vscode: ['🟦', ''], windsurf: ['🌊', ''],
+};
 
-  const doCopy = async (target: string) => {
-    await copy(mcpConfigJson);
-    setCopyMsg(`MCP config copied! Paste it into your ${target} configuration file.`);
-    setTimeout(() => setCopyMsg(null), 4000);
+function QuickBindSection({ mcpConfigJson }: { mcpConfigJson: string }) {
+  const [list, setList] = useState<AgentStatus[] | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [menuNode, openMenu] = useMenu();
+  const load = () => window.api.mcpAgents().then(setList).catch((e) => setNote({ ok: false, text: errText(e) }));
+  useEffect(() => { load(); }, []);
+
+  const set = async (targets: AgentStatus[], add: boolean) => {
+    setBusy(targets.length > 1 ? 'all' : targets[0].id); setNote(null);
+    const done: string[] = [], failed: string[] = [];
+    for (const t of targets) {
+      const r = await window.api.mcpAgentSet(t.id, add);
+      if (r.ok) done.push(`${t.name}: ${t.restart}`); else failed.push(`${t.name}: ${r.error.message}`);
+    }
+    setNote(failed.length ? { ok: false, text: failed.join('\n') } : { ok: true, text: add ? `Added. To load it: ${done.join(' ')}` : 'Removed.' });
+    setBusy(null); load();
+  };
+  const doCopy = async () => { await copy(mcpConfigJson); setNote({ ok: true, text: "MCP config copied. Paste it under the agent's MCP servers." }); };
+
+  const found = list?.filter((a) => a.detected || a.state !== 'missing') ?? [];
+  const others = list?.filter((a) => !found.includes(a)) ?? [];
+  const pending = found.filter((a) => a.state === 'missing' || a.state === 'other_build');
+
+  const restore = async (a: AgentStatus) => {
+    if (!(await window.api.agentBackupExists(a.id))) return setNote({ ok: false, text: `No backup of ${a.name}'s config yet (one is made on the first Add, Update or Remove).` });
+    if (!confirm(`Put back ${a.name}'s config as it was before the last change made here?
+
+${a.file}`)) return;
+    const r = await window.api.restoreAgentBackup(a.id);
+    setNote(r.ok ? { ok: true, text: `Restored. ${a.restart}` } : { ok: false, text: r.error.message }); load();
+  };
+  const cardMenu = (e: React.MouseEvent, a: AgentStatus) => {
+    const exists = a.state !== 'missing' || a.detected;
+    openMenu(e, [
+      a.state === 'missing' && { label: 'Add', icon: '➕', disabled: !!busy, onClick: () => set([a], true) },
+      a.state === 'other_build' && { label: 'Update to this app', icon: '↻', disabled: !!busy, onClick: () => set([a], true) },
+      (a.state === 'current' || a.state === 'other_build') && { label: 'Remove', icon: '➖', disabled: !!busy, onClick: () => set([a], false) },
+      '-',
+      exists && { label: 'Open config file', icon: '📄', onClick: () => window.api.openFile(a.file).then((r) => r !== true && setNote({ ok: false, text: r === 'missing' ? 'The config file does not exist yet: Add creates it.' : r })) },
+      exists && { label: 'Show in Explorer', icon: '📂', onClick: () => window.api.revealFile(a.file).then((ok) => !ok && setNote({ ok: false, text: 'The config file does not exist yet: Add creates it.' })) },
+      copyItem('Copy config file path', a.file),
+      copyItem('Copy MCP entry JSON', mcpConfigJson),
+      '-',
+      { label: 'Restore previous file…', icon: '↶', onClick: () => restore(a) },
+    ], a.name);
   };
 
-  const tools = [
-    {
-      id: 'claude',
-      name: 'Claude Desktop',
-      desc: 'Anthropic\'s Claude AI assistant',
-      icon: '🟠',
-      iconClass: 'claude',
-      configHint: 'claude_desktop_config.json → mcpServers',
-      docUrl: 'Settings → Developer → Edit Config',
-    },
-    {
-      id: 'codex',
-      name: 'Codex CLI',
-      desc: 'OpenAI\'s terminal coding agent',
-      icon: '🟢',
-      iconClass: 'codex',
-      configHint: '.codex/config.json → mcpServers',
-      docUrl: 'codex --configure',
-    },
-    {
-      id: 'antigravity',
-      name: 'Antigravity',
-      desc: 'Google\'s agentic coding assistant',
-      icon: '🔵',
-      iconClass: 'antigravity',
-      configHint: '.gemini/settings.json → mcpServers',
-      docUrl: 'Already configured if installed as plugin',
-    },
-  ];
+  const card = (a: AgentStatus) => {
+    const [icon, cls] = AGENT_ICON[a.id] ?? ['🤖', ''];
+    return (
+      <div key={a.id} className="bind-card" onContextMenu={(e) => cardMenu(e, a)}>
+        <button className="ghost bind-card-more" onClick={(e) => cardMenu(e, a)} title="More actions">⋯</button>
+        <div className="bind-card-header">
+          <div className={`bind-card-icon ${cls}`}>{icon}</div>
+          <div className="bind-card-info">
+            <div className="bind-name">{a.name}</div>
+            <div className="bind-desc">{{ current: '✓ Connected to this app', other_build: '⚠ Points at another copy of this app', missing: a.detected ? 'Not added yet' : 'Not found on this PC', unreadable: '⚠ Config could not be read' }[a.state]}</div>
+          </div>
+        </div>
+        <div className="muted small mono" style={{ fontSize: 11, wordBreak: 'break-all' }}>{a.file}</div>
+        {a.error && <div className="warn small">{a.error}</div>}
+        <div className="bind-card-actions">
+          {a.state === 'missing' && <button className="primary" disabled={!!busy} onClick={() => set([a], true)}>{busy === a.id ? 'Adding…' : '➕ Add'}</button>}
+          {a.state === 'other_build' && <button className="primary" disabled={!!busy} onClick={() => set([a], true)}>{busy === a.id ? 'Updating…' : '↻ Update to this app'}</button>}
+          {(a.state === 'current' || a.state === 'other_build') && <button disabled={!!busy} onClick={() => set([a], false)}>Remove</button>}
+          {a.state === 'unreadable' && <button onClick={doCopy}>📋 Copy MCP config</button>}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <fieldset>
-      <legend>Quick Bind — AI Agent Integration</legend>
+      <legend>Connect AI agents</legend>
       <p className="muted small" style={{ marginBottom: 12 }}>
-        Connect this SSH manager to your AI coding tools. Copy the MCP configuration and paste it into each tool's config file. This app never edits client configs.
+        One click adds this SSH manager as an MCP server to an AI agent. Only its own entry is written, everything else in the file stays; the previous file is kept as <span className="mono">*.sshrm.bak</span>.
       </p>
-      {copyMsg && <div className="success">✓ {copyMsg}</div>}
-      <div className="quick-bind-grid">
-        {tools.map((tool) => (
-          <div key={tool.id} className="bind-card">
-            <div className="bind-card-header">
-              <div className={`bind-card-icon ${tool.iconClass}`}>{tool.icon}</div>
-              <div className="bind-card-info">
-                <div className="bind-name">{tool.name}</div>
-                <div className="bind-desc">{tool.desc}</div>
-              </div>
-            </div>
-            <div className="muted small" style={{ fontSize: 11 }}>
-              Config: <span className="mono">{tool.configHint}</span>
-            </div>
-            <div className="muted small" style={{ fontSize: 11 }}>
-              {tool.docUrl}
-            </div>
-            <div className="bind-card-actions">
-              <button className="primary" onClick={() => doCopy(tool.name)}>📋 Copy MCP Config</button>
-            </div>
-          </div>
-        ))}
-      </div>
+      {pending.length > 1 && <button className="primary" style={{ marginBottom: 12 }} disabled={!!busy} onClick={() => set(pending, true)}>{busy === 'all' ? 'Adding…' : `➕ Add to all ${pending.length} agents found`}</button>}
+      {note && <div className={note.ok ? 'success' : 'error'} style={{ whiteSpace: 'pre-line' }}>{note.ok ? '✓ ' : ''}{note.text}</div>}
+      {!list ? <p className="muted">Looking for AI agents…</p> : (
+        <>
+          {found.length === 0 && <p className="muted small">No supported AI agent found on this PC. Use "Copy MCP config" below.</p>}
+          <div className="quick-bind-grid">{found.map(card)}</div>
+          {others.length > 0 && (
+            <details style={{ marginTop: 8 }}>
+              <summary className="muted small" style={{ cursor: 'pointer' }}>Other agents ({others.map((a) => a.name).join(', ')})</summary>
+              <div className="quick-bind-grid" style={{ marginTop: 8 }}>{others.map(card)}</div>
+            </details>
+          )}
+        </>
+      )}
       <details style={{ marginTop: 8 }}>
-        <summary className="muted small" style={{ cursor: 'pointer' }}>View raw MCP configuration JSON</summary>
+        <summary className="muted small" style={{ cursor: 'pointer' }}>Another agent? Copy the MCP configuration JSON</summary>
+        <button style={{ marginTop: 8 }} onClick={doCopy}>📋 Copy MCP config</button>
         <pre style={{ marginTop: 8 }}>{mcpConfigJson}</pre>
       </details>
+      {menuNode}
     </fieldset>
   );
 }

@@ -702,4 +702,11 @@ button.gd-file.sel .gd-mark:not(.dirty) { color: #fff; }
 .gd-diff-table tr.del { background: rgba(248, 81, 73, 0.15); }
 .gd-diff-table tr.del .ln { background: rgba(248, 81, 73, 0.25); }
 .gd-diff-table tr.hunk td { background: rgba(56, 139, 253, 0.12); color: var(--muted); padding: 3px 8px; }
-.gd-ignore { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+
+.context-menu-item:disabled { opacity: .45; cursor: default; background: none; }
+.context-menu-item:focus-visible { outline: none; background: var(--panel-hover); }
+.context-menu { max-width: 360px; }
+.context-menu-item > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.context-menu-item { padding: 5px 10px; }
+.bind-card { position: relative; }
+.bind-card-more { position: absolute; top: 8px; right: 8px; padding: 2px 8px; }
