@@ -555,6 +555,74 @@ test('host edits the sync never touches are kept as they are: no backup needed, 
   assert.equal(readFileSync(join(dst, 'Podfile.lock'), 'utf8'), 'pods from a Mac build\n');
 });
 
+test('skip-worktree files that differ from HEAD are reported, block a plain sync, and are stashed (flag cleared) only on the explicit backup', async () => {
+  const src = tempRepo({ 'a.txt': 'v1\n', 'proj.pbxproj': 'pods v1\n' });
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst, makeCore('gui'));
+  writeFileSync(join(src, 'base.txt'), 'base\n');
+  await syncNow(core, project, loc);
+  writeFileSync(join(src, 'proj.pbxproj'), 'pods v2\n');
+  git(src, 'commit', '-qam', 'v2');
+  writeFileSync(join(dst, 'proj.pbxproj'), 'pod install noise\n');
+  git(dst, 'update-index', '--skip-worktree', 'proj.pbxproj');
+  assert.equal(git(dst, 'status', '--porcelain', '--', 'proj.pbxproj'), '', 'git itself reports the file clean');
+  type Pre = { verdict: string; facts: { kind: string; blocking: boolean; paths?: string[] }[]; can_back_up: boolean };
+  const r = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, intent: 'transfer' }) as Pre;
+  assert.equal(r.verdict, 'destination_dirty');
+  assert.deepEqual(r.facts.find((f) => f.kind === 'hidden_local_changes')?.paths, ['proj.pbxproj']);
+  await assert.rejects(syncNow(core, project, loc), /nothing Sync now can do safely/);
+  assert.match(git(dst, 'ls-files', '-v', 'proj.pbxproj'), /^S /, 'a plain sync leaves the flag alone');
+  const s = await core.syncProject({ project_id: project.id, destination_location_id: loc.id, backup_host_changes: true }) as Sync & { backup: { stashed: number } };
+  assert.equal(s.outcome, 'verified');
+  assert.equal(s.backup.stashed, 1);
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.equal(git(dst, 'stash', 'show', '--name-only'), 'proj.pbxproj', 'the hidden content is kept in a named stash');
+  assert.equal(git(dst, 'show', 'stash@{0}:proj.pbxproj'), 'pod install noise');
+});
+
+test('an assume-unchanged file that differs from the source is reported and counts as dirty work like a visible edit', async () => {
+  const src = tempRepo({ 'a.txt': 'v1\n', 'proj.pbxproj': 'pods v1\n' });
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst);
+  writeFileSync(join(dst, 'proj.pbxproj'), 'noise\n');
+  git(dst, 'update-index', '--assume-unchanged', 'proj.pbxproj');
+  const r = await core.preflightProject({ project_id: project.id, destination_location_id: loc.id, intent: 'transfer' }) as { verdict: string; facts: { kind: string; blocking: boolean; paths?: string[] }[] };
+  assert.deepEqual(r.facts.find((f) => f.kind === 'hidden_local_changes')?.paths, ['proj.pbxproj']);
+  assert.equal(r.verdict, 'destination_dirty', 'it differs from the source, so it is dirty work exactly like a visible edit');
+  assert.ok(r.facts.some((f) => f.blocking && f.kind === 'destination_dirty' && f.paths?.includes('proj.pbxproj')));
+});
+
+test('sync errors name the failing step and the command that ran; the bundle lands as <private dir>/sync.bundle', async () => {
+  const src = tempRepo();
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst);
+  writeFileSync(join(dst, 'a.txt'), 'mac only\n');
+  git(dst, 'commit', '-qam', 'mac-only commit');
+  git(src, 'commit', '-q', '--allow-empty', '-m', 'pc commit');
+  await assert.rejects(syncNow(core, project, loc), (e: { message: string; details?: { step?: string; command?: string } }) =>
+    e.details?.step === 'updating the destination checkout' && /mktemp -d/.test(e.details.command ?? '') && /sync\.bundle/.test(e.details.command ?? '') && /\[step: /.test(e.message));
+});
+
+test('a fast-forward sends only the commits the host lacks, not the whole history', async () => {
+  const src = tempRepo();
+  for (let i = 0; i < 40; i++) { writeFileSync(join(src, `history${i}.txt`), `${i}\n${'x'.repeat(4000)}\n`); git(src, 'add', '-A'); git(src, 'commit', '-qm', `h${i}`); }
+  const dst = cloneTo(src);
+  const { core, project, loc } = setup(src, dst);
+  type R = Sync & { bundle: { bytes: number; incremental: boolean } | null };
+  writeFileSync(join(src, 'new.txt'), 'one more commit\n');
+  git(src, 'add', '-A'); git(src, 'commit', '-qm', 'new');
+  const r = await core.syncProject({ project_id: project.id, destination_location_id: loc.id }) as R;
+  assert.equal(r.outcome, 'verified');
+  assert.equal(git(dst, 'rev-parse', 'HEAD'), git(src, 'rev-parse', 'HEAD'));
+  assert.equal(r.bundle?.incremental, true);
+  const full = join(mkdtempSync(join(tmpdir(), 'sshrm-full-')), 'full.bundle');
+  git(src, 'bundle', 'create', '-q', full, 'HEAD', '--branches', '--tags');
+  assert.ok(r.bundle!.bytes < readFileSync(full).length / 4, `incremental ${r.bundle!.bytes} B vs full ${readFileSync(full).length} B`);
+  // the host fscks clean and has every commit
+  assert.equal(spawnSync('git', ['-C', dst, 'fsck', '--no-dangling'], { encoding: 'utf8' }).status, 0);
+  assert.equal(git(dst, 'rev-list', '--count', 'HEAD'), git(src, 'rev-list', '--count', 'HEAD'));
+});
+
 test('GUI file list marks host-dirty files; file preview diffs PC vs host and never reads credentials', async () => {
   const src = tempRepo();
   const dst = cloneTo(src);

@@ -264,6 +264,8 @@ type Entry = { p: string; t: 'f' | 'l'; h: string; g?: string };
 export type GitFacts = {
   available: boolean; is_repo: boolean; root?: string; subdir?: string; branch?: string | null; detached?: boolean; head?: string | null;
   root_commits?: string[]; remotes?: string[]; git_dir_is_file?: boolean;
+  /** Files flagged skip-worktree / assume-unchanged whose working content differs from the index: `git status` hides them, a merge over them aborts. */
+  hidden_paths?: string[];
   staged: number; unstaged: number; untracked: number; conflicts: number; dirty_paths: string[];
 };
 export type Inspection = {
@@ -358,6 +360,18 @@ async function addGitBlobIds(entries: Entry[], index: Map<string, string>, dirty
   files.forEach((e, i) => { e.g = ids[i]; });
 }
 
+/** Tracked files `git ls-files -v` tags S (skip-worktree) or lowercase (assume-unchanged): invisible to status/diff/stash. */
+const hiddenNames = (lsV: string[], index: Map<string, string>) => lsV.filter((l) => /^[Sa-z] /.test(l)).map((l) => l.slice(2)).filter((p) => index.has(p) && !p.includes('\n'));
+
+/** Of the hidden `names`, those whose working blob (`ids`, same order) differs from the index blob. An unreadable hash list counts them all (the safe side). */
+const changedHidden = (names: string[], ids: string[], index: Map<string, string>) => (ids.length === names.length ? names.filter((p, i) => ids[i] !== index.get(p)) : names);
+
+/** Fold hidden changes into the dirty facts so every later check (plans, backup, verify) treats them as uncommitted work. */
+function addHidden(facts: GitFacts, dirty: Set<string>, hidden: string[]) {
+  facts.hidden_paths = hidden;
+  for (const p of hidden) if (!dirty.has(p)) { dirty.add(p); facts.dirty_paths.push(p); facts.unstaged++; }
+}
+
 const finishManifest =(entries: Entry[], excluded: number) => {
   entries.sort((a, b) => (a.p < b.p ? -1 : a.p > b.p ? 1 : 0));
   return { count: entries.length, excluded, entries, digest: sha(entries.map((e) => `${e.p}\0${e.t}\0${e.h}`).join('\n')) };
@@ -402,6 +416,11 @@ async function inspectLocal(ctx: Ctx, path: string, policy: ConsistencyPolicy): 
     dirty = new Set(facts.dirty_paths);
     files = (await g(['ls-files', '-z', '--cached', '--others', '--exclude-standard'], 64 << 20)).stdout.split('\0').filter(Boolean);
     index = parseIndex((await g(['ls-files', '-s', '-z'], 64 << 20)).stdout);
+    const names = hiddenNames((await g(['ls-files', '-v', '-z'], 64 << 20)).stdout.split('\0'), index).filter((p) => { try { return lstatSync(join(canonical, p)).isFile(); } catch { return false; } });
+    if (names.length) {
+      const h = await g(['hash-object', '--stdin-paths'], 64 << 20, names.join('\n') + '\n');
+      addHidden(facts, dirty, changedHidden(names, h.exit_code === 0 ? h.stdout.split(/\r?\n/).filter(Boolean) : [], index));
+    }
   } else {
     files = [];
     const walk = (rel: string) => {
@@ -467,6 +486,8 @@ if [ "$G" = 1 ] && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true
   git -c core.quotepath=off ls-files -z --cached --others --exclude-standard | hashes
   D=$(mktemp) && git -c core.quotepath=off ls-files -m -o --exclude-standard | while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] && printf '%s\\n' "$f"; done > "$D"
   printf '@@DIRTYPATHS\\n'; cat "$D"; printf '\\n@@END\\n@@DIRTYIDS\\n'; [ -s "$D" ] && git hash-object --stdin-paths < "$D"; printf '\\n@@END\\n'; rm -f "$D"
+  HF=$(mktemp) && git -c core.quotepath=off ls-files -v | LC_ALL=C sed -n 's/^[Sa-z] //p' | while IFS= read -r f; do [ -f "$f" ] && [ ! -L "$f" ] && printf '%s\\n' "$f"; done > "$HF"
+  printf '@@HIDDEN\\n'; cat "$HF"; printf '\\n@@END\\n@@HIDDENIDS\\n'; [ -s "$HF" ] && git hash-object --stdin-paths < "$HF"; printf '\\n@@END\\n'; rm -f "$HF"
   printf '@@STATUS2\\n'; git -c core.quotepath=off status --porcelain=v2 -z --untracked-files=all -- .; printf '\\n@@END\\n'
 else
   echo "@@REPO 0"
@@ -544,7 +565,12 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
     // blob ids of dirty files were computed in the same session; anything missing falls back to byte comparison
     const dp = section(out, 'DIRTYPATHS').split('\n').filter(Boolean), di = section(out, 'DIRTYIDS').split('\n').filter(Boolean);
     const known = dp.length === di.length ? new Map(dp.map((p, i) => [p, di[i]])) : new Map<string, string>();
-    await addGitBlobIds(entries, parseIndex(section(out, 'INDEX')), dirty, async (input) => {
+    const hp = section(out, 'HIDDEN').split('\n').filter(Boolean), hi = section(out, 'HIDDENIDS').split('\n').filter(Boolean);
+    const index = parseIndex(section(out, 'INDEX'));
+    const hidden = changedHidden(hp, hi, index).filter((p) => index.has(p)); // untracked-but-listed names are not hidden changes
+    addHidden(facts, dirty, hidden);
+    if (hp.length === hi.length) hp.forEach((p, i) => known.set(p, hi[i]));
+    await addGitBlobIds(entries, index, dirty, async (input) => {
       const ids = input.split('\n').filter(Boolean).map((p) => known.get(p));
       return ids.every(Boolean) ? { stdout: ids.join('\n'), exit_code: 0 } : { stdout: '', exit_code: 1 };
     });
@@ -553,6 +579,18 @@ async function inspectRemote(ctx: Ctx, hostId: string, pathInput: string, policy
     path_state: 'exists', canonical_path: canonical, home, git: facts, stable: !isRepo || section(out, 'STATUS2') === status,
     layout_issues: layoutIssues(kept, scopedLinks, keptSet.has('.gitmodules'), false), manifest: finishManifest(entries, excluded),
   };
+}
+
+/**
+ * Source and destination are read at the same time (two independent machines: latency adds up otherwise). The destination's
+ * identity check reads the repository identity the source inspection records, so the very first inspection of a project stays sequential.
+ */
+async function inspectBoth(ctx: Ctx, project: ProjectRow, src: LocationRow, dest: LocationRow) {
+  if (!project.repository_identity_json) {
+    const s = await inspectLocation(ctx, project, src);
+    return [s, await inspectLocation(ctx, getProjectRow(ctx.db, project.id), dest)] as const;
+  }
+  return Promise.all([inspectLocation(ctx, project, src), inspectLocation(ctx, project, dest)]);
 }
 
 async function inspectLocation(ctx: Ctx, project: ProjectRow, l: LocationRow): Promise<{ id: string; inspection: Inspection; snapshot_id: string | null }> {
@@ -862,6 +900,16 @@ function compare(db: DB, project: ProjectRow, dest: LocationRow, srcId: string, 
     diff.dest_uncommitted = atRiskAll = destDirtyAtRisk;
     if (destDirtyAtRisk.length) add('destination_dirty', 'destination has uncommitted/untracked work that differs from source; it would be overwritten (no verified sync yet to tell who changed it)', destDirtyAtRisk);
   }
+  if (dg?.hidden_paths?.length) {
+    add('hidden_local_changes', `${dg.hidden_paths.length} file(s) on the destination are flagged skip-worktree/assume-unchanged (git ls-files -v: S or lowercase) and differ from HEAD; git status, diff and stash cannot see them, but a merge over them aborts`, dg.hidden_paths, false);
+    // Changed by the incoming sync = in the way of the fast-forward: never restored or overwritten silently.
+    const inWay = dg.hidden_paths.filter((p) => differing.includes(p) && !atRiskAll.includes(p));
+    if (inWay.length) {
+      atRiskAll = [...atRiskAll, ...inWay];
+      diff.dest_uncommitted = [...diff.dest_uncommitted, ...inWay];
+      add('destination_dirty', `${inWay.length} hidden (skip-worktree/assume-unchanged) file(s) on the destination differ from the source; clearing the flag is the user's call`, inWay);
+    }
+  }
   if (dg?.is_repo) {
     // Dirty on the host but not its own work: in scope here, and its content is either the source's or in the source's history.
     const risk = new Set([...atRiskAll, ...diff.kept]);
@@ -954,7 +1002,7 @@ function gitPlan(kind: 'clone' | 'switch' | 'fast_forward', src: Inspection, roo
       'verify_sync with source_snapshot and generations from this preflight (no new preflight needed in between; verify re-reads both sides)',
     ].filter(Boolean),
     // What the GUI's "Sync now" runs (syncProject): host lines read the bundle from "$B"; GUI-only, stripped from MCP output.
-    exec: { local, root, branch, host: [apply('"$B"')], restore: synced, copy, lf, remove: gone } as SyncExec,
+    exec: { local, root, branch, base: kind === 'fast_forward' ? dst?.git?.head ?? undefined : undefined, host: [apply('"$B"')], restore: synced, copy, lf, remove: gone } as SyncExec,
   };
 }
 
@@ -969,7 +1017,8 @@ function goneInSource(src: Inspection, policy: ConsistencyPolicy) {
 }
 
 /** Host-side work for syncProject: `restore` earlier synced copies, run `host` with the bundle of `branch` in "$B", unpack `copy` (tar, `lf` files as LF) into `root`, then `remove` deleted paths. */
-type SyncExec = { local: string; root: string; branch?: string; host: string[]; restore: string[]; copy: string[]; lf: string[]; remove: string[] };
+/** base: the destination's HEAD for a fast-forward; the bundle then carries only commits the host lacks. */
+type SyncExec = { local: string; root: string; branch?: string; base?: string; host: string[]; restore: string[]; copy: string[]; lf: string[]; remove: string[] };
 
 /**
  * A copied working-tree file carries this checkout's bytes: a Windows autocrlf checkout has CRLF where Git (and the host)
@@ -1066,8 +1115,7 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
     intent: z.enum(['build', 'run', 'test', 'transfer', 'inspect']).default('build'), detail: z.enum(['summary', 'full']).default('summary'),
     basis: z.enum(['source', 'destination']).default('source') }).strict().parse(raw);
   const { project, src, dest } = locationsFor(ctx.db, input.project_id, input.destination_location_id);
-  const s = await inspectLocation(ctx, project, src);
-  const d = await inspectLocation(ctx, getProjectRow(ctx.db, project.id), dest);
+  const [s, d] = await inspectBoth(ctx, project, src, dest);
   const policy = effectivePolicy(ctx.db, dest);
   const known = await sourceKnowledge(ctx, s.inspection, d.inspection);
   const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, policy, known);
@@ -1114,7 +1162,7 @@ export async function preflightProject(ctx: Ctx, raw: unknown) {
   const t = now();
   // summary: counts plus a few paths per blocking fact; detail:"full" keeps every list, ids and the raw inspections.
   // Everything static (what verdict/execution/readiness mean) lives in the tool description, not in every response.
-  const compact = (f: Fact) => (full || !f.paths ? f : !f.blocking ? { ...f, paths: undefined }
+  const compact = (f: Fact) => (full || !f.paths || f.kind === 'hidden_local_changes' ? f : !f.blocking ? { ...f, paths: undefined }
     : f.paths.length <= 5 ? f : { ...f, paths: f.paths.slice(0, 5), paths_total: f.paths.length });
   const toolchainOut = full || !['not_applicable', 'not_checked'].includes(toolchain.state) ? toolchain : undefined;
   return {
@@ -1152,12 +1200,11 @@ export async function verifyProjectSync(ctx: Ctx, raw: unknown) {
     record('needs_recheck', { reason: 'location generations changed (path/policy/host edited)' });
     return { verification_id: id, outcome: 'needs_recheck', reason: 'location generations changed since preflight; run preflight again' };
   }
-  const s = await inspectLocation(ctx, project, src);
+  const [s, d] = await inspectBoth(ctx, project, src, dest);
   if (s.snapshot_id !== input.expected_source_snapshot || !s.inspection.stable) {
     record('needs_recheck', { reason: 'source_changed', source_snapshot: s.snapshot_id, source_inspection_id: s.id });
     return { verification_id: id, outcome: 'needs_recheck', reason: 'source changed after preflight; the transferred content may be stale', source_snapshot: s.snapshot_id };
   }
-  const d = await inspectLocation(ctx, project, dest);
   const { facts, diff } = compare(ctx.db, getProjectRow(ctx.db, project.id), getLocationRow(ctx.db, dest.id), src.id, s.inspection, d.inspection, effectivePolicy(ctx.db, dest), await sourceKnowledge(ctx, s.inspection, d.inspection));
   const verdict = verdictOf(facts);
   const matched = s.inspection.manifest!.count - diff.missing.length - diff.changed.length;
@@ -1187,13 +1234,20 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
     const remote = async (script: string, input: Buffer, what: string) => {
       const r = await sshRun(ctx, host, script, s.inspect_timeout_s, { input, maxBytes: 64 << 10 });
       if (r.exit_code === 0) return r.stdout;
-      const refused = /fast-forward|non-fast-forward|would be overwritten/i.test(r.stderr);
+      const err = sanitize(r.stderr);
+      const overwritten = /would be overwritten/i.test(err) && !/untracked working tree files/i.test(err); // untracked files in the way are a different problem
+      const refused = overwritten || /fast-forward|non-fast-forward|would be overwritten/i.test(err);
       // Git's own lines first ("fatal: ..."), its multi-line "hint:" advice dropped: the reason must survive the cut.
-      const why = sanitize(r.stderr).split('\n').filter((l) => l.trim() && !l.startsWith('hint:')).join('\n').slice(0, 400);
+      const why = err.split('\n').filter((l) => l.trim() && !l.startsWith('hint:')).join('\n').slice(0, 400);
+      // Files git names under "would be overwritten" are the tab-indented lines of its message.
+      const inWay = overwritten ? err.split('\n').filter((l) => /^\s+\S/.test(l)).map((l) => l.trim()).slice(0, 20) : [];
+      const command = script.replace(/\s+/g, ' ').trim().slice(0, 600); // the exact script that ran on the host (paths only, no secrets)
       throw new AppError(r.exit_code === 255 ? classify(r).code : 'REMOTE_COMMAND_FAILED',
-        refused ? `${what} refused by git, nothing was overwritten: the host branch has commits this PC does not have (or edits in the way). ${why}` : `${what} failed (exit ${r.exit_code}): ${why}`,
-        { details: { diagnostics: diagnostics(r), ...(refused ? { verdict: 'destination_ahead' } : {}) },
-          next_action: refused ? 'Show the user the host\'s own commits (preflight facts / git log on the host) and ask; never force. To build what is on the host as it is, preflight with basis:"destination".' : 'Run preflight again to see the current state.' });
+        (overwritten ? `${what} refused by git, nothing was overwritten: these destination files have local changes the update would replace${inWay.length ? ` (${inWay.join(', ')})` : ''}. If git status shows them clean, check for skip-worktree/assume-unchanged flags: git ls-files -v | grep -E '^[Sa-z]'. ${why}`
+          : refused ? `${what} refused by git, nothing was overwritten: the host branch has commits this PC does not have (or edits in the way). ${why}` : `${what} failed (exit ${r.exit_code}): ${why}`) + ` [step: ${what}; command: ${command}]`,
+        { details: { diagnostics: diagnostics(r), step: what, command, ...(inWay.length ? { paths: inWay } : {}), ...(overwritten ? { verdict: 'destination_dirty' } : refused ? { verdict: 'destination_ahead' } : {}) },
+          next_action: overwritten ? 'Show the user these files and ask: stash them (clearing any skip-worktree flag first so the content is kept in a named stash), or move them aside. Never force.'
+            : refused ? 'Show the user the host\'s own commits (preflight facts / git log on the host) and ask; never force. To build what is on the host as it is, preflight with basis:"destination".' : 'Run preflight again to see the current state.' });
     };
     const local = async (cmd: string[], args: string[], what: string, cwd: string) => {
       const r = await run(cmd, args, { cwd, timeoutMs: s.inspect_timeout_s * 1000 });
@@ -1204,19 +1258,26 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
     let pre = await preflight();
     let backup: { stashed: number; message: string } | null = null;
     const branches = { updated: [] as string[], skipped: [] as string[] };
+    let bundle: { bytes: number; incremental: boolean } | null = null;
     if (!(pre.suggested_plan as { exec?: SyncExec }).exec && input.backup_host_changes && ctx.source === 'gui' && pre.can_back_up) {
       // The host's own uncommitted files go into a git stash there (git stash list / git stash pop), never deleted.
       const mine = (pre.files ?? []).filter((f) => f.host_dirty).map((f) => f.path);
       const message = `SSH Resource Manager backup before sync ${now()}`;
       const root = posixQuote(pre.summary.destination.path ?? '');
       const who = 'git config user.email >/dev/null || export GIT_AUTHOR_NAME="SSH Resource Manager" GIT_AUTHOR_EMAIL=sshrm@localhost GIT_COMMITTER_NAME="SSH Resource Manager" GIT_COMMITTER_EMAIL=sshrm@localhost';
+      // Hidden (skip-worktree/assume-unchanged) files are invisible to stash: clear the flag only here, on the explicit backup request,
+      // and only for files that are being stashed, so their content lands in the named stash instead of being lost.
+      const hidden = new Set(pre.facts.find((f) => f.kind === 'hidden_local_changes')?.paths);
+      const flagged = mine.filter((p) => hidden.has(p));
+      if (flagged.length) await remote(`cd ${root} && xargs -0 sh -c 'git update-index --no-skip-worktree -- "$@" && git update-index --no-assume-unchanged -- "$@"' _`, list(flagged), 'clearing skip-worktree flags before the backup');
       await remote(`cd ${root} && ${who}; git stash push -q --include-untracked -m ${posixQuote(message)} --pathspec-from-file=- --pathspec-file-nul`, list(mine), 'backing up host changes');
       backup = { stashed: mine.length, message };
       pre = await preflight();
     }
     const exec = (pre.suggested_plan as { exec?: SyncExec }).exec;
-    if (!exec) throw new AppError('VALIDATION_ERROR', `nothing Sync now can do safely (verdict ${pre.verdict})${backup ? ` after backing up ${backup.stashed} host file(s) into git stash "${backup.message}"` : ''}`, { next_action: pre.summary.next_step,
-      details: { verdict: pre.verdict, blocking: pre.facts.filter((f) => f.blocking).map((f) => ({ kind: f.kind, detail: f.detail, paths: f.paths?.slice(0, 10) })) } });
+    const hiddenFact = pre.facts.find((f) => f.kind === 'hidden_local_changes' && pre.facts.some((x) => x.kind === 'destination_dirty' && x.paths?.some((p) => f.paths?.includes(p))));
+    if (!exec) throw new AppError('VALIDATION_ERROR', `nothing Sync now can do safely (verdict ${pre.verdict})${backup ? ` after backing up ${backup.stashed} host file(s) into git stash "${backup.message}"` : ''}`, { next_action: pre.summary.next_step + (hiddenFact ? ' Some of these files are hidden from git status by skip-worktree/assume-unchanged: ask the user before clearing the flag (git update-index --no-skip-worktree), then stash them under a name.' : ''),
+      details: { hidden_local_changes: hiddenFact?.paths?.slice(0, 20), verdict: pre.verdict, blocking: pre.facts.filter((f) => f.blocking).map((f) => ({ kind: f.kind, detail: f.detail, paths: f.paths?.slice(0, 10) })) } });
     const r = posixQuote(exec.root);
     if (exec.restore.length) {
       await remote(`cd ${r} && xargs -0 sh -c 'for p; do git checkout -q HEAD -- "$p" 2>/dev/null || rm -f -- "$p"; done' _`, list(exec.restore), 'restoring previously synced copies');
@@ -1225,12 +1286,33 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
       const b = join(tmp, 'sync.bundle');
       // Every local branch and tag rides along. The checked-out one moves via exec.host (fast-forward only); the others are
       // fetched one by one: git itself refuses a non-fast-forward or a branch checked out on the host, which we report, never force.
-      await local(splitCommand(s.git_path), ['bundle', 'create', '-q', b, exec.branch, '--branches', '--tags'], 'git bundle', exec.local);
       const others = `git -C ${r} bundle list-heads "$B" | while read -r sha ref; do case "$ref" in refs/heads/*) n=\${ref#refs/heads/}; ` +
         `[ "$n" = ${posixQuote(exec.branch)} ] && continue; [ "$(git -C ${r} rev-parse -q --verify "$ref")" = "$sha" ] && continue; ` +
         `if git -C ${r} fetch -q "$B" "$ref:$ref" 2>/dev/null; then echo "sshrm-updated $n"; else echo "sshrm-skipped $n"; fi;; esac; done; ` +
         `git -C ${r} fetch -q "$B" 'refs/tags/*:refs/tags/*' 2>/dev/null || echo "sshrm-skipped tags"`;
-      const out = await remote(`B=$(mktemp) && cat > "$B" && ${exec.host.join(' && ')} && { ${others}; }; rc=$?; rm -f "$B"; exit $rc`, readFileSync(b), 'updating the destination checkout');
+      // The bundle lands in a private dir under a .bundle name (BSD and GNU mktemp -d alike; $B is absolute), and its size is checked
+      // before git sees it: a short upload would otherwise surface as git's "invalid gitfile format", which names neither step nor cause.
+      // Fast-forward: send only what the host lacks (^base = its HEAD), not the whole history of every branch on each sync. If this PC
+      // cannot build that (it lacks the host's HEAD) or the host reports missing prerequisites, the full bundle is sent instead.
+      const build = async (incremental: boolean) => {
+        const args = ['bundle', 'create', '-q', b, exec.branch!, '--branches', '--tags', ...(incremental ? [`^${exec.base}`] : [])];
+        await local(splitCommand(s.git_path), args, 'git bundle', exec.local);
+        return readFileSync(b);
+      };
+      let incremental = !!exec.base && /^[0-9a-f]{40,64}$/.test(exec.base);
+      let bytes: Buffer;
+      try { bytes = await build(incremental); } catch (e) { if (!incremental) throw e; incremental = false; bytes = await build(false); }
+      const upload = (n: number) => `D=$(mktemp -d) && B="$D/sync.bundle" || exit 1; cat > "$B"; got=$(wc -c < "$B" | tr -d ' '); ` +
+        `[ "$got" = ${n} ] || { echo "sshrm: bundle upload incomplete: the host received $got of ${n} bytes" >&2; rm -rf "$D"; exit 97; }; `;
+      const send = (data: Buffer) => remote(`${upload(data.length)}git bundle list-heads "$B" >/dev/null && ${exec.host.join(' && ')} && { ${others}; }; rc=$?; rm -rf "$D"; exit $rc`, data, 'updating the destination checkout');
+      let out: string;
+      bundle = { bytes: bytes.length, incremental };
+      try { out = await send(bytes); } catch (e) {
+        if (!incremental || !/prerequisite/i.test((e as Error).message)) throw e;
+        const full = await build(false);
+        bundle = { bytes: full.length, incremental: false };
+        out = await send(full); // the host's HEAD moved or differs from what preflight read: full bundle, git still refuses non-fast-forward
+      }
       for (const m of out.matchAll(/^sshrm-(updated|skipped) (.+)$/gm)) branches[m[1] as 'updated' | 'skipped'].push(m[2]);
     }
     if (exec.copy.length) {
@@ -1245,7 +1327,7 @@ export async function syncProject(ctx: Ctx, raw: unknown) {
     const kept = backup ? ` ${backup.stashed} host file(s) were kept in git stash "${backup.message}" on the host (git stash list).` : '';
     const other = (branches.updated.length ? ` Also updated ${branches.updated.length} other branch(es): ${branches.updated.slice(0, 10).join(', ')}.` : '') +
       (branches.skipped.length ? ` Left alone (${branches.skipped.join(', ').slice(0, 300)}): the host has its own commits there or has it checked out.` : '');
-    return { outcome: v.outcome, verdict: (v as { verdict?: string }).verdict ?? null, commit: pre.summary.source.head, files_copied: exec.copy.length, backup, branches,
+    return { outcome: v.outcome, verdict: (v as { verdict?: string }).verdict ?? null, commit: pre.summary.source.head, files_copied: exec.copy.length, backup, branches, bundle,
       note: (v.outcome === 'verified' ? `Synced${pre.summary.source.head ? ` to ${pre.summary.source.head}` : ''} and verified.` : `Sync ran but verify says ${v.outcome}: ${'reason' in v ? v.reason : 'run Preflight'}`) + other + kept };
   } finally {
     releaseLease(ctx, { location_id: dest.id, operation_id: op, owner });
